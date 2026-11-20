@@ -1,6 +1,6 @@
 -- =============================================================================
--- GIDA DEDEKTİFİ - VERİTABANI ŞEMASI (SUPABASE / POSTGRESQL)
--- 1. Gün: Temel Tablolar ve İndeksler
+-- İREM - GIDA & ETİKET ANALİZ PROJESİ VERİTABANI ŞEMASI (SUPABASE / POSTGRESQL)
+-- 1. Gün: Temel Tablolar ve İndeksler (Nötr ve Bilgilendirici Veri Yapısı)
 -- =============================================================================
 
 -- UUID fonksiyonları için eklenti (Supabase'de varsayılan etkindir)
@@ -36,45 +36,45 @@ CREATE INDEX IF NOT EXISTS idx_urunler_besin_degerleri ON urunler USING GIN (bes
 
 -- -----------------------------------------------------------------------------
 -- 2. TABLO: e_kodlari
--- Gıda katkı maddeleri, sağlık riskleri ve hassasiyet etiketleri
+-- Gıda katkı maddeleri, fonksiyonel tanımları ve bilgilendirme etiketleri
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS e_kodlari (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     kod VARCHAR(20) NOT NULL UNIQUE, -- örn: 'E621', 'E171'
     ad VARCHAR(255) NOT NULL,        -- örn: 'Monosodyum Glutamat'
     aciklama TEXT,
-    risk_seviyesi VARCHAR(50) CHECK (risk_seviyesi IN ('dusuk', 'orta', 'yuksek')),
-    hassasiyet_etiketleri TEXT[] DEFAULT ARRAY[]::TEXT[], -- örn: ['helal_supheli', 'cocuklar_icin_uyari', 'alerjen']
+    oncelik_seviyesi VARCHAR(50) CHECK (oncelik_seviyesi IN ('standart', 'sinirli_tuketim', 'dikkat_onerilen')),
+    bilgilendirme_etiketleri TEXT[] DEFAULT ARRAY[]::TEXT[], -- örn: ['aroma_artirici', 'koruyucu', 'alerjen_bilgisi']
     bilimsel_kaynak TEXT,
     olusturulma_tarihi TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- e_kodlari tablosu için indeksler
 CREATE INDEX IF NOT EXISTS idx_e_kodlari_kod ON e_kodlari(kod);
-CREATE INDEX IF NOT EXISTS idx_e_kodlari_risk_seviyesi ON e_kodlari(risk_seviyesi);
-CREATE INDEX IF NOT EXISTS idx_e_kodlari_hassasiyet ON e_kodlari USING GIN (hassasiyet_etiketleri);
+CREATE INDEX IF NOT EXISTS idx_e_kodlari_oncelik_seviyesi ON e_kodlari(oncelik_seviyesi);
+CREATE INDEX IF NOT EXISTS idx_e_kodlari_bilgilendirme ON e_kodlari USING GIN (bilgilendirme_etiketleri);
 
 -- -----------------------------------------------------------------------------
--- 3. TABLO: tagsis_listesi
--- T.C. Tarım ve Orman Bakanlığı taklit veya tağşiş yapılan gıdalar listesi
+-- 3. TABLO: resmi_duyuru_kayitlari
+-- T.C. Tarım ve Orman Bakanlığı kamuya açık resmi gıda duyuru kayıtları
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS tagsis_listesi (
+CREATE TABLE IF NOT EXISTS resmi_duyuru_kayitlari (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     firma_adi VARCHAR(255) NOT NULL,
     marka VARCHAR(255),
     urun_adi VARCHAR(255) NOT NULL,
-    uygunsuzluk_nedeni TEXT,       -- örn: 'Tek tırnaklı eti tespiti', 'Bitkisel yağ tespiti'
+    duyuru_konusu TEXT,            -- Kamuya açık resmi duyuruda yer alan bildirim metni
     parti_seri_no VARCHAR(100),
     duyuru_tarihi DATE,
     resmi_kaynak_url TEXT,
     olusturulma_tarihi TIMESTAMPTZ DEFAULT NOW()
 );
 
--- tagsis_listesi tablosu için indeksler
-CREATE INDEX IF NOT EXISTS idx_tagsis_firma_adi ON tagsis_listesi(firma_adi);
-CREATE INDEX IF NOT EXISTS idx_tagsis_marka ON tagsis_listesi(marka);
-CREATE INDEX IF NOT EXISTS idx_tagsis_urun_adi ON tagsis_listesi(urun_adi);
-CREATE INDEX IF NOT EXISTS idx_tagsis_duyuru_tarihi ON tagsis_listesi(duyuru_tarihi DESC);
+-- resmi_duyuru_kayitlari tablosu için indeksler
+CREATE INDEX IF NOT EXISTS idx_resmi_duyuru_firma_adi ON resmi_duyuru_kayitlari(firma_adi);
+CREATE INDEX IF NOT EXISTS idx_resmi_duyuru_marka ON resmi_duyuru_kayitlari(marka);
+CREATE INDEX IF NOT EXISTS idx_resmi_duyuru_urun_adi ON resmi_duyuru_kayitlari(urun_adi);
+CREATE INDEX IF NOT EXISTS idx_resmi_duyuru_tarihi ON resmi_duyuru_kayitlari(duyuru_tarihi DESC);
 
 -- -----------------------------------------------------------------------------
 -- Güncelleme Zamanı için Otomatik Tetikleyici (urunler tablosu için)

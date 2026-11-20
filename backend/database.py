@@ -8,6 +8,7 @@ Taranan ürünleri `database/irem.db` içerisinde önbelleğe (cache) alır.
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,7 +35,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
     Veritabanı tablosunu (`products`) ve gerekli indeksleri oluşturur.
     Uygulama başlangıcında otomatik çağrılır.
     """
-    with _get_connection(db_path) as conn:
+    with closing(_get_connection(db_path)) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS products (
@@ -69,7 +70,7 @@ def get_cached_product(
     - Geçerli kayıt varsa tam ürün verisini `"from_cache": True` olarak döner.
     """
     cleaned_barcode = barcode.strip()
-    with _get_connection(db_path) as conn:
+    with closing(_get_connection(db_path)) as conn:
         row = conn.execute(
             """
             SELECT barcode, product_name, brands, score, grade,
@@ -128,7 +129,7 @@ def save_product(
     stored_payload["from_cache"] = False
     response_json_str = json.dumps(stored_payload, ensure_ascii=False)
 
-    with _get_connection(db_path) as conn:
+    with closing(_get_connection(db_path)) as conn:
         conn.execute(
             """
             INSERT INTO products (
@@ -166,7 +167,7 @@ def get_recent_products(
     Son taranan/güncellenen ürünleri yeniden eskiye doğru sıralı olarak döndürür.
     """
     safe_limit = max(1, min(100, int(limit)))
-    with _get_connection(db_path) as conn:
+    with closing(_get_connection(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT barcode, product_name, brands, score, grade,

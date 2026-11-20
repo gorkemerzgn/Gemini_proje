@@ -149,10 +149,10 @@ async def fetch_product_by_barcode(barcode: str) -> Dict[str, Any]:
             detail=f"'{cleaned_barcode}' barkod numarasına ait ürün kaydı açık veri kaynağında bulunamadı.",
         )
 
-    if response.status_code >= 500:
+    if response.status_code != 200:
         raise HTTPException(
             status_code=503,
-            detail="Dış ürün veri kaynağı (Open Food Facts) geçici olarak yanıt vermiyor.",
+            detail="Dış ürün veri kaynağı (Open Food Facts) geçici olarak yanıt vermiyor veya istek sınırına ulaşıldı.",
         )
 
     try:
