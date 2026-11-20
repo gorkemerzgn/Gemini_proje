@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from openfoodfacts import fetch_product_by_barcode
 from scoring import DEFAULT_DISCLAIMER, calculate_product_score
 
 # .env dosyasındaki ortam değişkenlerini yükle
@@ -14,7 +15,7 @@ load_dotenv()
 app = FastAPI(
     title="İrem - Gıda & Etiket Analiz API",
     description="Barkod tarama, yapay zekâ ile etiket analizi ve taklit-tağşiş kontrolü API servisi",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # Mobil uygulama ve web istemcileri için CORS izinleri
@@ -95,6 +96,33 @@ class ScoreResponse(BaseModel):
     )
 
 
+class ProductAnalysisResponse(BaseModel):
+    """Barkod ile sorgulanan ürünün detaylı bilgileri ve puanlama sonucu"""
+
+    barcode: str = Field(description="Ürün barkod numarası")
+    product_name: str = Field(description="Ürün adı")
+    brands: Optional[str] = Field(default=None, description="Marka bilgisi")
+    image_url: Optional[str] = Field(default=None, description="Ürün görseli URL adresi")
+    ingredients_text: Optional[str] = Field(default=None, description="İçindekiler metni")
+    nutrition: NutritionValues = Field(description="100g/100ml başına besin değerleri")
+    additives: List[str] = Field(default_factory=list, description="Tespit edilen E-kodları")
+    has_palm_oil: bool = Field(default=False, description="İçerikte palm yağı tespit edildi mi?")
+    has_glucose_syrup: bool = Field(
+        default=False, description="İçerikte glikoz/fruktoz şurubu tespit edildi mi?"
+    )
+    data_source: str = Field(default="open_food_facts", description="Veri kaynağı")
+    score: int = Field(ge=0, le=100, description="Hesaplanan nihai ürün puanı (0 - 100)")
+    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
+        description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor)"
+    )
+    warnings: List[str] = Field(description="Türkçe içerik ve besin bilgilendirme notları")
+    breakdown: ScoreBreakdown = Field(description="Kategori bazlı puan kırılımı")
+    disclaimer: str = Field(
+        default=DEFAULT_DISCLAIMER,
+        description="Bilgilendirme ve yasal sorumluluk reddi metni",
+    )
+
+
 # -----------------------------------------------------------------------------
 # API Uç Noktaları (Endpoints)
 # -----------------------------------------------------------------------------
@@ -103,7 +131,7 @@ def read_root():
     """Kök uç noktası - Servis karşılama mesajı"""
     return {
         "message": "Gıda Dedektifi API çalışıyor",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "docs": "/docs",
     }
 
@@ -121,7 +149,7 @@ def health_check():
 def score_product(payload: ScoreRequest) -> ScoreResponse:
     """
     Ürünün besin değerleri (%60), katkı maddeleri (%30), doğal içerik (%10)
-    ve Tarım Bakanlığı taklit-tağşiş durumuna göre 0-100 arası puanını hesaplar.
+    ve kamuya açık resmi duyuru durumuna göre 0-100 arası puanını hesaplar.
     """
     result = calculate_product_score(
         nutrition=payload.nutrition.model_dump(),
@@ -133,4 +161,45 @@ def score_product(payload: ScoreRequest) -> ScoreResponse:
     return ScoreResponse(
         product_name=payload.product_name,
         **result,
+    )
+
+
+@app.get("/api/product/{barcode}", response_model=ProductAnalysisResponse)
+async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
+    """
+    Barkod numarası ile ürünü Open Food Facts veri tabanından çeker,
+    puanlama motorundan geçirir ve ürün bilgileriyle birlikte analiz sonucunu döndürür.
+    """
+    product_data = await fetch_product_by_barcode(barcode)
+
+    score_result = calculate_product_score(
+        nutrition=product_data["nutrition"],
+        additives=product_data["additives"],
+        is_adulterated=False,
+        has_palm_oil=product_data["has_palm_oil"],
+        has_glucose_syrup=product_data["has_glucose_syrup"],
+    )
+
+    warnings = list(score_result["warnings"])
+    if product_data.get("has_missing_nutrition"):
+        warnings.append(
+            "Bilgi Notu: Bu ürünün bazı besin değeri verileri kaynakta eksik olabilir."
+        )
+
+    return ProductAnalysisResponse(
+        barcode=product_data["barcode"],
+        product_name=product_data["product_name"],
+        brands=product_data["brands"],
+        image_url=product_data["image_url"],
+        ingredients_text=product_data["ingredients_text"],
+        nutrition=NutritionValues(**product_data["nutrition"]),
+        additives=product_data["additives"],
+        has_palm_oil=product_data["has_palm_oil"],
+        has_glucose_syrup=product_data["has_glucose_syrup"],
+        data_source=product_data["data_source"],
+        score=score_result["score"],
+        grade=score_result["grade"],
+        warnings=warnings,
+        breakdown=ScoreBreakdown(**score_result["breakdown"]),
+        disclaimer=score_result["disclaimer"],
     )
