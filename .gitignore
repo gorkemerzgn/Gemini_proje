@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Sanal Ortamlar (Virtual Environments)
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Ortam Değişkenleri (Environment Variables)
+.env
+.env.*
+!.env.example
+
+# Node.js & React Native (Expo)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.expo/
+.expo-shared/
+web-build/
+dist/
+
+# IDE & Editörler
+.vscode/
+*.code-workspace
+.idea/
+*.swp
+*.swo
+
+# İşletim Sistemi
+.DS_Store
+Thumbs.db
+desktop.ini

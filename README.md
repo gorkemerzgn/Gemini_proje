@@ -1,1 +1,1 @@
-# Gemini_proje
+# İrem - Gıda & Etiket Analiz Projesi
