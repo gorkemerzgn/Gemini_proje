@@ -1,21 +1,35 @@
 import os
+from contextlib import asynccontextmanager
 from typing import List, Literal, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from database import get_cached_product, get_recent_products, init_db, save_product
 from openfoodfacts import fetch_product_by_barcode
 from scoring import DEFAULT_DISCLAIMER, calculate_product_score
 
 # .env dosyasındaki ortam değişkenlerini yükle
 load_dotenv()
 
+# Modül yüklendiğinde ve uygulama başlarken SQLite tablosunun hazır olmasını sağla
+init_db()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Uygulama başlangıcında yerel SQLite veritabanı tablosunu hazırlar."""
+    init_db()
+    yield
+
+
 # FastAPI uygulama başlatma
 app = FastAPI(
     title="İrem - Gıda & Etiket Analiz API",
     description="Barkod tarama, yapay zekâ ile etiket analizi ve taklit-tağşiş kontrolü API servisi",
-    version="0.3.0",
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 # Mobil uygulama ve web istemcileri için CORS izinleri
@@ -111,12 +125,40 @@ class ProductAnalysisResponse(BaseModel):
         default=False, description="İçerikte glikoz/fruktoz şurubu tespit edildi mi?"
     )
     data_source: str = Field(default="open_food_facts", description="Veri kaynağı")
+    from_cache: bool = Field(
+        default=False,
+        description="Ürün verisi yerel SQLite önbelleğinden mi getirildi?",
+    )
     score: int = Field(ge=0, le=100, description="Hesaplanan nihai ürün puanı (0 - 100)")
     grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
         description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor)"
     )
     warnings: List[str] = Field(description="Türkçe içerik ve besin bilgilendirme notları")
     breakdown: ScoreBreakdown = Field(description="Kategori bazlı puan kırılımı")
+    disclaimer: str = Field(
+        default=DEFAULT_DISCLAIMER,
+        description="Bilgilendirme ve yasal sorumluluk reddi metni",
+    )
+
+
+class RecentProductItem(BaseModel):
+    """Son taranan ürünler listesindeki özet ürün modeli"""
+
+    barcode: str = Field(description="Ürün barkod numarası")
+    product_name: str = Field(description="Ürün adı")
+    brands: Optional[str] = Field(default=None, description="Marka bilgisi")
+    image_url: Optional[str] = Field(default=None, description="Ürün görseli URL adresi")
+    score: int = Field(ge=0, le=100, description="Hesaplanan ürün puanı (0 - 100)")
+    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(description="Puan derecesi")
+    created_at: str = Field(description="İlk kayıt tarihi (ISO-8601 UTC)")
+    updated_at: str = Field(description="Son güncellenme tarihi (ISO-8601 UTC)")
+
+
+class RecentProductsResponse(BaseModel):
+    """Son taranan ürünler yanıt modeli"""
+
+    count: int = Field(description="Dönen ürün sayısı")
+    items: List[RecentProductItem] = Field(description="Son taranan ürünler listesi")
     disclaimer: str = Field(
         default=DEFAULT_DISCLAIMER,
         description="Bilgilendirme ve yasal sorumluluk reddi metni",
@@ -131,7 +173,7 @@ def read_root():
     """Kök uç noktası - Servis karşılama mesajı"""
     return {
         "message": "Gıda Dedektifi API çalışıyor",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "docs": "/docs",
     }
 
@@ -164,12 +206,33 @@ def score_product(payload: ScoreRequest) -> ScoreResponse:
     )
 
 
+@app.get("/api/products/recent", response_model=RecentProductsResponse)
+def list_recent_products(
+    limit: int = Query(default=10, ge=1, le=100, description="Listelenecek maksimum ürün sayısı"),
+) -> RecentProductsResponse:
+    """
+    Yerel veritabanına kaydedilmiş son taranan ürünleri yeniden eskiye doğru listeler.
+    """
+    recent_rows = get_recent_products(limit=limit)
+    items = [RecentProductItem(**row) for row in recent_rows]
+    return RecentProductsResponse(
+        count=len(items),
+        items=items,
+        disclaimer=DEFAULT_DISCLAIMER,
+    )
+
+
 @app.get("/api/product/{barcode}", response_model=ProductAnalysisResponse)
 async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
     """
-    Barkod numarası ile ürünü Open Food Facts veri tabanından çeker,
-    puanlama motorundan geçirir ve ürün bilgileriyle birlikte analiz sonucunu döndürür.
+    Barkod numarası ile ürünü önce yerel SQLite önbelleğinde (30 gün geçerli) arar.
+    Önbellekte yoksa veya süresi dolmuşsa Open Food Facts veri tabanından çeker,
+    puanlama motorundan geçirir, veritabanına kaydeder ve analiz sonucunu döndürür.
     """
+    cached = get_cached_product(barcode)
+    if cached is not None:
+        return ProductAnalysisResponse(**cached)
+
     product_data = await fetch_product_by_barcode(barcode)
 
     score_result = calculate_product_score(
@@ -186,7 +249,7 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
             "Bilgi Notu: Bu ürünün bazı besin değeri verileri kaynakta eksik olabilir."
         )
 
-    return ProductAnalysisResponse(
+    response_obj = ProductAnalysisResponse(
         barcode=product_data["barcode"],
         product_name=product_data["product_name"],
         brands=product_data["brands"],
@@ -197,9 +260,13 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
         has_palm_oil=product_data["has_palm_oil"],
         has_glucose_syrup=product_data["has_glucose_syrup"],
         data_source=product_data["data_source"],
+        from_cache=False,
         score=score_result["score"],
         grade=score_result["grade"],
         warnings=warnings,
         breakdown=ScoreBreakdown(**score_result["breakdown"]),
         disclaimer=score_result["disclaimer"],
     )
+
+    save_product(response_obj.model_dump())
+    return response_obj
