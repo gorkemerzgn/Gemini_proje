@@ -28,7 +28,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="İrem - Gıda & Etiket Analiz API",
     description="Barkod tarama, yapay zekâ ile etiket analizi ve taklit-tağşiş kontrolü API servisi",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -165,6 +165,40 @@ class RecentProductsResponse(BaseModel):
     )
 
 
+class MethodologyWeightItem(BaseModel):
+    """Puanlama metodolojisi kategori ağırlık kalemi"""
+
+    category: str = Field(description="Değerlendirme kategorisi")
+    max_points: int = Field(description="Maksimum puan")
+    percentage: int = Field(description="Toplam skordaki ağırlık yüzdesi (%)")
+    description: str = Field(description="Kategorinin değerlendirme kapsamı")
+
+
+class MethodologyReferenceItem(BaseModel):
+    """Referans alınan resmi veya bilimsel kurum/doküman bilgisi"""
+
+    institution: str = Field(description="Kurum veya otorite adı")
+    document: str = Field(description="Referans doküman veya rehber adı")
+    scope: str = Field(description="Puanlama motorunda yararlanılan kapsam")
+
+
+class MethodologyResponse(BaseModel):
+    """Puanlama şeffaflığı, metodoloji ve resmi kaynaklar yanıt modeli"""
+
+    title: str = Field(description="Metodoloji başlığı")
+    summary: str = Field(description="Genel puanlama yaklaşımı özeti")
+    weights: List[MethodologyWeightItem] = Field(description="Puanlama ağırlık dağılımı")
+    special_rules: List[str] = Field(description="Özel bilgilendirme ve sınır kuralları")
+    references: List[MethodologyReferenceItem] = Field(
+        description="Eşik değerlerde yararlanılan bilimsel ve resmi referanslar"
+    )
+    legal_notice: str = Field(description="Bağımsızlık ve hukuki şeffaflık bildirimi")
+    disclaimer: str = Field(
+        default=DEFAULT_DISCLAIMER,
+        description="Bilgilendirme ve yasal sorumluluk reddi metni",
+    )
+
+
 # -----------------------------------------------------------------------------
 # API Uç Noktaları (Endpoints)
 # -----------------------------------------------------------------------------
@@ -173,7 +207,7 @@ def read_root():
     """Kök uç noktası - Servis karşılama mesajı"""
     return {
         "message": "Gıda Dedektifi API çalışıyor",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "docs": "/docs",
     }
 
@@ -185,6 +219,86 @@ def health_check():
         "status": "healthy",
         "service": "backend-api",
     }
+
+
+@app.get("/api/methodology", response_model=MethodologyResponse)
+def get_methodology() -> MethodologyResponse:
+    """
+    Puanlama motorunun ağırlık dağılımını, yararlanılan ulusal/uluslararası
+    bilimsel referansları ve hukuki şeffaflık bildirimini döndürür.
+    """
+    return MethodologyResponse(
+        title="Nasıl Puanlıyoruz? Metodoloji ve Referanslar",
+        summary=(
+            "İrem puanlama motoru, ürün etiketlerinde yer alan kamuya açık besin ve içerik "
+            "verilerini ulusal ve uluslararası beslenme rehberlerindeki referans eşiklere göre "
+            "0 ile 100 arasında ölçeklendirir."
+        ),
+        weights=[
+            MethodologyWeightItem(
+                category="Besin Değerleri",
+                max_points=60,
+                percentage=60,
+                description=(
+                    "100g/100ml başına enerji (kalori), şeker, doymuş yağ ve tuz/sodyum "
+                    "yoğunluğu ile lif ve protein katkısını değerlendirir."
+                ),
+            ),
+            MethodologyWeightItem(
+                category="Katkı Maddeleri (E-Kodları)",
+                max_points=30,
+                percentage=30,
+                description=(
+                    "İçerikte yer alan katkı maddelerinin sayısını ve fonksiyonel gruplarını "
+                    "(koruyucu, renklendirici, tatlandırıcı, kıvam artırıcı vb.) değerlendirir."
+                ),
+            ),
+            MethodologyWeightItem(
+                category="İçerik Profili",
+                max_points=10,
+                percentage=10,
+                description=(
+                    "Ürünün genel içerik sadeliğini, palm yağı ve glikoz/fruktoz şurubu gibi "
+                    "endüstriyel bileşenlerin varlığını değerlendirir."
+                ),
+            ),
+        ],
+        special_rules=[
+            "Kamuya açık resmi duyuru kaydı bulunan ürün veya partilerde toplam skor, "
+            "genel bilgilendirme amacıyla en fazla 10 puan ile sınırlandırılır.",
+            "80-100 puan: 'Çok İyi', 60-79 puan: 'İyi', 40-59 puan: 'Orta', "
+            "0-39 puan: 'Düşük Skor' olarak sınıflandırılır.",
+        ],
+        references=[
+            MethodologyReferenceItem(
+                institution="T.C. Tarım ve Orman Bakanlığı",
+                document="Türk Gıda Kodeksi (Gıda Katkı Maddeleri ve Etiketleme Yönetmelikleri)",
+                scope="Etiket beyan kuralları, E-kodu fonksiyonel tanımları ve kamuya açık resmi gıda duyuruları.",
+            ),
+            MethodologyReferenceItem(
+                institution="T.C. Sağlık Bakanlığı",
+                document="Türkiye Beslenme Rehberi (TÜBER)",
+                scope="Şeker, tuz/sodyum, doymuş yağ, lif ve protein için dengeli beslenme referans eşikleri.",
+            ),
+            MethodologyReferenceItem(
+                institution="Dünya Sağlık Örgütü (WHO / DSÖ)",
+                document="Serbest Şeker, Sodyum ve Doymuş Yağ Günlük Alım Rehberleri",
+                scope="100g/100ml başına şeker, tuz ve doymuş yağ yoğunluğu değerlendirme sınırları.",
+            ),
+            MethodologyReferenceItem(
+                institution="Avrupa Gıda Güvenliği Otoritesi (EFSA)",
+                document="Gıda Katkı Maddeleri Bilimsel Görüş ve Değerlendirme Raporları",
+                scope="Katkı maddelerinin (E-kodları) fonksiyonel sınıflandırması ve tüketim duyarlılığı referansları.",
+            ),
+        ],
+        legal_notice=(
+            "Bu uygulama bağımsız bir tüketici bilgilendirme aracıdır; adı geçen resmi kurum ve "
+            "kuruluşlarla herhangi bir kurumsal bağlantısı veya resmi onay ilişkisi bulunmamaktadır. "
+            "Sunulan skorlar yalnızca kamuya açık etiket verilerinin bilimsel referans eşiklerine göre "
+            "otomatik hesaplanmasıyla oluşturulur; tıbbi, diyetetik veya hukuki tavsiye ya da kesin yargı niteliği taşımaz."
+        ),
+        disclaimer=DEFAULT_DISCLAIMER,
+    )
 
 
 @app.post("/api/score", response_model=ScoreResponse)
