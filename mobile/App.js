@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import {
   ActivityIndicator,
   Image,
@@ -11,14 +11,18 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from "react-native";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import { API_BASE_URL } from "./config";
 
 const SAMPLE_BARCODES = [
   { label: "Nutella (3017620422003)", barcode: "3017620422003" },
   { label: "Barilla Makarna (8076800195057)", barcode: "8076800195057" },
 ];
+
+const SUPPORTED_BARCODE_TYPES = ["ean13", "ean8", "upc_a", "upc_e"];
 
 const FALLBACK_METHODOLOGY = {
   title: "Nasıl Puanlıyoruz? Metodoloji ve Referanslar",
@@ -144,16 +148,30 @@ function ProgressBar({ label, value, max, color }) {
 }
 
 export default function App() {
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+
   const [barcode, setBarcode] = useState("");
   const [product, setProduct] = useState(null);
   const [recentProducts, setRecentProducts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [recentLoading, setRecentLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [notFoundBarcode, setNotFoundBarcode] = useState(null);
 
+  // Metodoloji Modal state'leri
   const [methodologyVisible, setMethodologyVisible] = useState(false);
   const [methodology, setMethodology] = useState(FALLBACK_METHODOLOGY);
   const [methodologyLoading, setMethodologyLoading] = useState(false);
+
+  // Kamera ve Barkod Tarayıcı state'leri
+  const [permission, requestPermission] = useCameraPermissions();
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [torchEnabled, setTorchEnabled] = useState(false);
+  const [scannedLock, setScannedLock] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState(null);
+  const scanLockRef = useRef(false);
+  const cameraRef = useRef(null);
 
   const fetchRecentProducts = useCallback(async () => {
     setRecentLoading(true);
@@ -190,66 +208,285 @@ export default function App() {
     fetchRecentProducts();
   }, [fetchRecentProducts]);
 
-  const analyzeBarcode = async (targetBarcode) => {
-    const cleaned = (targetBarcode ?? barcode).trim();
-    if (!cleaned) {
-      setErrorMsg("Lütfen analiz etmek için geçerli bir barkod numarası girin.");
-      return;
-    }
-
-    Keyboard.dismiss();
-    setBarcode(cleaned);
-    setLoading(true);
-    setErrorMsg(null);
-
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/product/${encodeURIComponent(cleaned)}`
-      );
-
-      let data = null;
-      try {
-        data = await response.json();
-      } catch (_parseErr) {
-        data = null;
-      }
-
-      if (!response.ok) {
-        if (response.status === 404) {
-          setProduct(null);
-          setErrorMsg(
-            data?.detail ||
-              `'${cleaned}' barkod numarasına ait ürün kaydı açık veri kaynağında bulunamadı.`
-          );
-        } else if (response.status === 503) {
-          setProduct(null);
-          setErrorMsg(
-            data?.detail ||
-              "Dış ürün veri kaynağına şu anda ulaşılamıyor. Lütfen biraz sonra tekrar deneyin."
-          );
-        } else {
-          setProduct(null);
-          setErrorMsg(
-            data?.detail || `Sunucu hatası oluştu (HTTP ${response.status}).`
-          );
-        }
+  const analyzeBarcode = useCallback(
+    async (targetBarcode) => {
+      const cleaned = (targetBarcode ?? barcode).trim();
+      if (!cleaned) {
+        setNotFoundBarcode(null);
+        setErrorMsg("Lütfen analiz etmek için geçerli bir barkod numarası girin.");
         return;
       }
 
-      setProduct(data);
-      fetchRecentProducts();
-    } catch (_networkErr) {
-      setProduct(null);
-      setErrorMsg(
-        `Sunucuya bağlanılamadı (${API_BASE_URL}). Telefonunuzun ve bilgisayarınızın aynı Wi-Fi ağında olduğundan ve backend sunucusunun 8001 portunda çalıştığından emin olun.`
-      );
-    } finally {
-      setLoading(false);
+      Keyboard.dismiss();
+      setBarcode(cleaned);
+      setLoading(true);
+      setErrorMsg(null);
+      setNotFoundBarcode(null);
+
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/api/product/${encodeURIComponent(cleaned)}`
+        );
+
+        let data = null;
+        try {
+          data = await response.json();
+        } catch (_parseErr) {
+          data = null;
+        }
+
+        if (!response.ok) {
+          setProduct(null);
+          if (response.status === 404) {
+            setNotFoundBarcode(cleaned);
+          } else if (response.status === 503) {
+            setErrorMsg(
+              data?.detail ||
+                "Dış ürün veri kaynağına şu anda ulaşılamıyor. Lütfen biraz sonra tekrar deneyin."
+            );
+          } else {
+            setErrorMsg(
+              data?.detail || `Sunucu hatası oluştu (HTTP ${response.status}).`
+            );
+          }
+          return;
+        }
+
+        setProduct(data);
+        fetchRecentProducts();
+      } catch (_networkErr) {
+        setProduct(null);
+        setNotFoundBarcode(null);
+        setErrorMsg(
+          `Sunucuya bağlanılamadı (${API_BASE_URL}). Telefonunuzun ve bilgisayarınızın aynı Wi-Fi ağında olduğundan ve backend sunucusunun 8001 portunda çalıştığından emin olun.`
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [barcode, fetchRecentProducts]
+  );
+
+  // Kamera ekranını açma
+  const handleOpenScanner = async () => {
+    Keyboard.dismiss();
+    scanLockRef.current = false;
+    setScannedLock(false);
+    setTorchEnabled(false);
+    setCameraReady(false);
+    setCameraError(null);
+    setScannerOpen(true);
+
+    if (!permission?.granted) {
+      await requestPermission();
     }
   };
 
+  // Kamera ekranını kapatma
+  const handleCloseScanner = () => {
+    setTorchEnabled(false);
+    setScannerOpen(false);
+    setCameraReady(false);
+    setCameraError(null);
+    scanLockRef.current = false;
+    setScannedLock(false);
+  };
+
+  // Barkod okunduğunda çift okumayı engelleyip otomatik analiz başlatma
+  const handleBarcodeScanned = (scanResult) => {
+    if (scanLockRef.current || scannedLock) {
+      return;
+    }
+
+    const rawData = String(scanResult?.data || "").trim();
+    if (!rawData) {
+      return;
+    }
+
+    // Ardışık/çift taramayı anında kilitle
+    scanLockRef.current = true;
+    setScannedLock(true);
+    setTorchEnabled(false);
+    setScannerOpen(false);
+
+    // Barkodu kutuya yaz ve analizi otomatik başlat
+    setBarcode(rawData);
+    analyzeBarcode(rawData);
+  };
+
+  // Android'de CameraView mount olduktan sonra önizlemeyi garantiye almak için resumePreview çağrısı
+  useEffect(() => {
+    if (!scannerOpen || permission?.granted !== true) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (cameraRef.current?.resumePreview) {
+        cameraRef.current.resumePreview().catch(() => {});
+      }
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [scannerOpen, permission?.granted]);
+
   const scoreTheme = product ? getScoreTheme(product.score) : null;
 
+  // ---------------------------------------------------------------------------
+  // TAM EKRAN KAMERA GÖRÜNÜMÜ (3 Bölgeli Dengeli Yerleşim)
+  // ---------------------------------------------------------------------------
+  if (scannerOpen) {
+    const camWidth = Math.max(1, Math.round(windowWidth || 360));
+    const camHeight = Math.max(
+      1,
+      cameraReady
+        ? Math.round(windowHeight || 640)
+        : Math.round(windowHeight || 640) - 1
+    );
+
+    return (
+      <View style={styles.scannerFullScreen}>
+        <StatusBar barStyle="light-content" backgroundColor="#000000" />
+
+        {!permission ? (
+          <View style={styles.permissionCenterBox}>
+            <ActivityIndicator size="large" color="#16A34A" />
+            <Text style={styles.permissionSubtext}>
+              Kamera izni kontrol ediliyor...
+            </Text>
+          </View>
+        ) : permission.granted !== true ? (
+          <View style={styles.permissionCenterBox}>
+            <Text style={styles.permissionIcon}>📷</Text>
+            <Text style={styles.permissionTitle}>Kamera İzni Gerekiyor</Text>
+            <Text style={styles.permissionSubtext}>
+              Ürün paketleri üzerindeki barkodları kamera ile okutabilmek için
+              kamera erişim izni vermeniz gerekmektedir.
+            </Text>
+
+            <TouchableOpacity
+              style={styles.permissionGrantBtn}
+              onPress={requestPermission}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.permissionGrantBtnText}>
+                Kamera İznini Ver
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.permissionCancelBtn}
+              onPress={handleCloseScanner}
+            >
+              <Text style={styles.permissionCancelBtnText}>
+                Vazgeç ve Ana Ekrana Dön
+              </Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <View style={styles.cameraRootContainer}>
+            {/* 1. KENDİ KENDİNE KAPANAN CAMERAVIEW */}
+            <CameraView
+              ref={cameraRef}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: camWidth,
+                height: camHeight,
+              }}
+              facing="back"
+              mode="picture"
+              autofocus="on"
+              enableTorch={torchEnabled}
+              barcodeScannerSettings={{
+                barcodeTypes: SUPPORTED_BARCODE_TYPES,
+              }}
+              onCameraReady={() => {
+                setCameraReady(true);
+              }}
+              onBarcodeScanned={scannedLock ? undefined : handleBarcodeScanned}
+              onMountError={(event) => {
+                const msg =
+                  event?.nativeEvent?.message ||
+                  event?.message ||
+                  "Kamera başlatılırken bir hata oluştu.";
+                setCameraError(msg);
+              }}
+            />
+
+            {/* 2. KARDEŞ (SIBLING) ŞEFFAF OVERLAY KATMANI (3 Dengeli Bölge) */}
+            <View
+              style={[StyleSheet.absoluteFillObject, styles.cameraOverlayLayer]}
+              pointerEvents="box-none"
+            >
+              {/* BÖLGE 1 (ÜST): KAPAT VE FENER BUTONLARI */}
+              <View style={styles.cameraTopBar} pointerEvents="box-none">
+                <TouchableOpacity
+                  style={styles.cameraControlBtn}
+                  onPress={handleCloseScanner}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.cameraControlBtnText}>✕ Kapat</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[
+                    styles.cameraControlBtn,
+                    torchEnabled && styles.cameraTorchActiveBtn,
+                  ]}
+                  onPress={() => setTorchEnabled((prev) => !prev)}
+                  activeOpacity={0.8}
+                >
+                  <Text
+                    style={[
+                      styles.cameraControlBtnText,
+                      torchEnabled && styles.cameraTorchActiveText,
+                    ]}
+                  >
+                    {torchEnabled ? "🔦 Fener Açık" : "🔦 Fener"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* BÖLGE 2 (TAM ORTA): YEŞİL TARAMA ÇERÇEVESİ VE LAZER ÇİZGİSİ */}
+              <View style={styles.viewfinderWrapper} pointerEvents="none">
+                {cameraError && (
+                  <View style={styles.cameraErrorBanner}>
+                    <Text style={styles.cameraErrorBannerText}>
+                      Kamera Hatası: {cameraError}
+                    </Text>
+                  </View>
+                )}
+
+                <View style={styles.viewfinderBox}>
+                  <View style={[styles.corner, styles.cornerTopLeft]} />
+                  <View style={[styles.corner, styles.cornerTopRight]} />
+                  <View style={[styles.corner, styles.cornerBottomLeft]} />
+                  <View style={[styles.corner, styles.cornerBottomRight]} />
+                  <View style={styles.scanLaserLine} />
+                </View>
+              </View>
+
+              {/* BÖLGE 3 (ALT): YÖNLENDİRME BİLGİ KARTI */}
+              <View style={styles.cameraBottomBar} pointerEvents="none">
+                <View style={styles.cameraHintCard}>
+                  <Text style={styles.cameraHintTitle}>
+                    Barkodu Çerçeveye Hizalayın
+                  </Text>
+                  <Text style={styles.cameraHintSubtitle}>
+                    EAN-13, EAN-8 ve UPC ürün barkodları algılandığında otomatik
+                    olarak analiz başlatılır.
+                  </Text>
+                </View>
+              </View>
+            </View>
+          </View>
+        )}
+      </View>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // ANA UYGULAMA EKRANI
+  // ---------------------------------------------------------------------------
   return (
     <View style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#F8FAFC" />
@@ -286,9 +523,30 @@ export default function App() {
           </View>
         </View>
 
-        {/* BARKOD ARAMA KUTUSU */}
+        {/* BARKOD TARAMA VE ARAMA KARTI */}
         <View style={styles.searchCard}>
-          <Text style={styles.sectionLabel}>Barkod ile Ürün Sorgula</Text>
+          {/* KAMERA İLE BARKOD TARA BUTONU */}
+          <TouchableOpacity
+            style={styles.cameraScanButton}
+            onPress={handleOpenScanner}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.cameraScanIcon}>📷</Text>
+            <View style={styles.cameraScanTextCol}>
+              <Text style={styles.cameraScanTitle}>Kamera ile Barkod Tara</Text>
+              <Text style={styles.cameraScanSubtitle}>
+                Ürün barkodunu kameraya okutarak anında analiz edin
+              </Text>
+            </View>
+            <Text style={styles.cameraScanArrow}>›</Text>
+          </TouchableOpacity>
+
+          <View style={styles.dividerRow}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>veya elle barkod girin</Text>
+            <View style={styles.dividerLine} />
+          </View>
+
           <View style={styles.inputRow}>
             <TextInput
               style={styles.input}
@@ -344,10 +602,47 @@ export default function App() {
           </View>
         </View>
 
-        {/* HATA MESAJI KARTI */}
+        {/* 404 BULUNAMAYAN ÜRÜN BİLGİ KARTI */}
+        {notFoundBarcode && (
+          <View style={styles.notFoundCard}>
+            <View style={styles.notFoundHeaderRow}>
+              <View style={styles.notFoundIconBadge}>
+                <Text style={styles.notFoundIconText}>🔍</Text>
+              </View>
+              <View style={styles.notFoundTitleCol}>
+                <Text style={styles.notFoundTitle}>
+                  Ürün Henüz Veritabanında Yok
+                </Text>
+                <Text style={styles.notFoundBarcodeTag}>
+                  Barkod: #{notFoundBarcode}
+                </Text>
+              </View>
+            </View>
+
+            <Text style={styles.notFoundDescription}>
+              Okuttuğunuz{" "}
+              <Text style={styles.notFoundBold}>#{notFoundBarcode}</Text> barkod
+              numaralı ürün açık gıda veritabanında henüz kayıtlı değil. Çok
+              yakında <Text style={styles.notFoundBold}>"İçindekiler"</Text>{" "}
+              etiketi fotoğrafıyla analiz özelliği eklenecektir.
+            </Text>
+
+            <TouchableOpacity
+              style={styles.notFoundScanAgainBtn}
+              onPress={handleOpenScanner}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.notFoundScanAgainBtnText}>
+                📷 Başka Ürün Tara
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* BAĞLANTI / SUNUCU HATASI KARTI (503, Ağ Kopması vb.) */}
         {errorMsg && (
           <View style={styles.errorCard}>
-            <Text style={styles.errorTitle}>Bilgilendirme</Text>
+            <Text style={styles.errorTitle}>Bağlantı / Sunucu Uyarısı</Text>
             <Text style={styles.errorText}>{errorMsg}</Text>
           </View>
         )}
@@ -598,8 +893,8 @@ export default function App() {
           {recentProducts.length === 0 ? (
             <View style={styles.emptyRecentBox}>
               <Text style={styles.emptyRecentText}>
-                Henüz taranmış bir ürün bulunmuyor. Yukarıdan bir barkod
-                sorgulayarak başlayabilirsiniz.
+                Henüz taranmış bir ürün bulunmuyor. Yukarıdan barkod okutarak
+                veya numara girerek başlayabilirsiniz.
               </Text>
             </View>
           ) : (
@@ -860,11 +1155,57 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     elevation: 2,
   },
-  sectionLabel: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#334155",
-    marginBottom: 10,
+  cameraScanButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#0F172A",
+    borderRadius: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 3,
+  },
+  cameraScanIcon: {
+    fontSize: 24,
+    marginRight: 12,
+  },
+  cameraScanTextCol: {
+    flex: 1,
+  },
+  cameraScanTitle: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  cameraScanSubtitle: {
+    color: "#CBD5E1",
+    fontSize: 11.5,
+    marginTop: 2,
+  },
+  cameraScanArrow: {
+    color: "#22C55E",
+    fontSize: 24,
+    fontWeight: "800",
+    marginLeft: 8,
+  },
+  dividerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginVertical: 14,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "#E2E8F0",
+  },
+  dividerText: {
+    fontSize: 12,
+    color: "#64748B",
+    fontWeight: "600",
+    marginHorizontal: 10,
   },
   inputRow: {
     position: "relative",
@@ -944,6 +1285,77 @@ const styles = StyleSheet.create({
     color: "#334155",
     fontWeight: "600",
   },
+
+  /* 404 BULUNAMAYAN ÜRÜN KARTI STİLLERİ */
+  notFoundCard: {
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1.5,
+    borderColor: "#CBD5E1",
+    borderRadius: 20,
+    padding: 18,
+    marginBottom: 18,
+    shadowColor: "#0F172A",
+    shadowOpacity: 0.05,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+  },
+  notFoundHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  notFoundIconBadge: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  notFoundIconText: {
+    fontSize: 22,
+  },
+  notFoundTitleCol: {
+    flex: 1,
+  },
+  notFoundTitle: {
+    fontSize: 16.5,
+    fontWeight: "800",
+    color: "#0F172A",
+  },
+  notFoundBarcodeTag: {
+    fontSize: 12.5,
+    fontWeight: "600",
+    color: "#64748B",
+    marginTop: 2,
+  },
+  notFoundDescription: {
+    fontSize: 13.5,
+    color: "#475569",
+    lineHeight: 20,
+    marginBottom: 16,
+  },
+  notFoundBold: {
+    fontWeight: "700",
+    color: "#0F172A",
+  },
+  notFoundScanAgainBtn: {
+    backgroundColor: "#0F172A",
+    borderRadius: 14,
+    paddingVertical: 13,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notFoundScanAgainBtnText: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+
   errorCard: {
     backgroundColor: "#FEF2F2",
     borderWidth: 1,
@@ -1351,6 +1763,195 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
     fontWeight: "800",
   },
+
+  /* KAMERA TARAYICI TAM EKRAN STİLLERİ (3 DENGELİ BÖLGE) */
+  scannerFullScreen: {
+    flex: 1,
+    backgroundColor: "#000000",
+  },
+  cameraRootContainer: {
+    flex: 1,
+    backgroundColor: "transparent",
+  },
+  cameraOverlayLayer: {
+    flex: 1,
+    justifyContent: "space-between",
+    backgroundColor: "transparent",
+  },
+  permissionCenterBox: {
+    flex: 1,
+    backgroundColor: "#0F172A",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 28,
+  },
+  permissionIcon: {
+    fontSize: 48,
+    marginBottom: 14,
+  },
+  permissionTitle: {
+    fontSize: 20,
+    fontWeight: "800",
+    color: "#FFFFFF",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  permissionSubtext: {
+    fontSize: 14,
+    color: "#CBD5E1",
+    textAlign: "center",
+    lineHeight: 20,
+    marginBottom: 24,
+  },
+  permissionGrantBtn: {
+    backgroundColor: "#16A34A",
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    borderRadius: 14,
+    width: "100%",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  permissionGrantBtnText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  permissionCancelBtn: {
+    paddingVertical: 12,
+  },
+  permissionCancelBtnText: {
+    color: "#94A3B8",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  cameraTopBar: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingTop: Platform.OS === "android" ? 48 : 58,
+    paddingHorizontal: 20,
+    paddingBottom: 12,
+    backgroundColor: "transparent",
+  },
+  cameraControlBtn: {
+    backgroundColor: "rgba(15, 23, 42, 0.78)",
+    paddingHorizontal: 18,
+    paddingVertical: 11,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.25)",
+  },
+  cameraTorchActiveBtn: {
+    backgroundColor: "#FACC15",
+    borderColor: "#EAB308",
+  },
+  cameraControlBtnText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  cameraTorchActiveText: {
+    color: "#0F172A",
+  },
+  cameraErrorBanner: {
+    marginHorizontal: 20,
+    marginBottom: 16,
+    backgroundColor: "rgba(220, 38, 38, 0.9)",
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+  },
+  cameraErrorBannerText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+  viewfinderWrapper: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "transparent",
+  },
+  viewfinderBox: {
+    width: 270,
+    height: 180,
+    borderRadius: 20,
+    backgroundColor: "transparent",
+    justifyContent: "center",
+    alignItems: "center",
+    position: "relative",
+  },
+  corner: {
+    position: "absolute",
+    width: 36,
+    height: 36,
+    borderColor: "#22C55E",
+  },
+  cornerTopLeft: {
+    top: 0,
+    left: 0,
+    borderTopWidth: 4,
+    borderLeftWidth: 4,
+    borderTopLeftRadius: 16,
+  },
+  cornerTopRight: {
+    top: 0,
+    right: 0,
+    borderTopWidth: 4,
+    borderRightWidth: 4,
+    borderTopRightRadius: 16,
+  },
+  cornerBottomLeft: {
+    bottom: 0,
+    left: 0,
+    borderBottomWidth: 4,
+    borderLeftWidth: 4,
+    borderBottomLeftRadius: 16,
+  },
+  cornerBottomRight: {
+    bottom: 0,
+    right: 0,
+    borderBottomWidth: 4,
+    borderRightWidth: 4,
+    borderBottomRightRadius: 16,
+  },
+  scanLaserLine: {
+    width: "84%",
+    height: 2,
+    backgroundColor: "#22C55E",
+    opacity: 0.85,
+  },
+  cameraBottomBar: {
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    paddingBottom: Platform.OS === "android" ? 44 : 52,
+    backgroundColor: "transparent",
+  },
+  cameraHintCard: {
+    backgroundColor: "rgba(15, 23, 42, 0.82)",
+    borderRadius: 18,
+    paddingVertical: 15,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.15)",
+    alignItems: "center",
+  },
+  cameraHintTitle: {
+    color: "#FFFFFF",
+    fontSize: 15.5,
+    fontWeight: "800",
+    marginBottom: 4,
+  },
+  cameraHintSubtitle: {
+    color: "#CBD5E1",
+    fontSize: 12.5,
+    textAlign: "center",
+    lineHeight: 18,
+  },
+
+  /* METODOLOJİ MODAL STİLLERİ */
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(15, 23, 42, 0.55)",
