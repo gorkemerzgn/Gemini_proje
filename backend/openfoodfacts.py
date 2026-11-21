@@ -59,6 +59,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_optional_float(value: Any) -> Optional[float]:
+    """Değeri güvenli şekilde pozitif float'a çevirir; eksik (None/'') veya geçersizse None döndürür."""
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+        return max(0.0, parsed)
+    except (ValueError, TypeError):
+        return None
+
+
 def _extract_e_codes(additives_tags: Optional[List[Any]]) -> List[str]:
     """
     Open Food Facts 'additives_tags' listesini (örn: ['en:e322', 'en:e322i', 'en:e471'])
@@ -216,22 +227,39 @@ async def fetch_product_by_barcode(barcode: str) -> Dict[str, Any]:
     )
 
     # Kalori değeri energy-kcal_100g yoksa energy-kj_100g / 4.184 üzerinden hesaplanabilir
-    raw_kcal = nutriments.get("energy-kcal_100g")
-    if raw_kcal is None and nutriments.get("energy_100g") is not None:
-        raw_kcal = round(_safe_float(nutriments.get("energy_100g")) / 4.184, 1)
+    raw_kcal = _safe_optional_float(nutriments.get("energy-kcal_100g"))
+    if raw_kcal is None:
+        raw_kj = _safe_optional_float(
+            nutriments.get("energy-kj_100g")
+            if nutriments.get("energy-kj_100g") is not None
+            else nutriments.get("energy_100g")
+        )
+        if raw_kj is not None:
+            raw_kcal = round(raw_kj / 4.184, 1)
 
     # Open Food Facts'te sodium_100g genellikle gram cinsinden tutulur -> mg'a çevir
-    raw_sodium_g = _safe_float(nutriments.get("sodium_100g"), 0.0)
-    sodium_mg = round(raw_sodium_g * 1000.0, 2) if raw_sodium_g < 50 else raw_sodium_g
+    raw_sodium_g = _safe_optional_float(nutriments.get("sodium_100g"))
+    sodium_mg: Optional[float] = None
+    if raw_sodium_g is not None:
+        sodium_mg = round(raw_sodium_g * 1000.0, 2) if raw_sodium_g < 50 else round(raw_sodium_g, 2)
+
+    raw_sugar = _safe_optional_float(nutriments.get("sugars_100g"))
+    raw_sat_fat = _safe_optional_float(nutriments.get("saturated-fat_100g"))
+    raw_salt = _safe_optional_float(nutriments.get("salt_100g"))
+    if raw_salt is None and sodium_mg is not None:
+        raw_salt = round((sodium_mg / 1000.0) * 2.5, 3)
+
+    raw_fiber = _safe_optional_float(nutriments.get("fiber_100g"))
+    raw_protein = _safe_optional_float(nutriments.get("proteins_100g"))
 
     nutrition = {
-        "sugar_g": round(_safe_float(nutriments.get("sugars_100g"), 0.0), 2),
-        "saturated_fat_g": round(_safe_float(nutriments.get("saturated-fat_100g"), 0.0), 2),
-        "salt_g": round(_safe_float(nutriments.get("salt_100g"), 0.0), 3),
+        "sugar_g": round(raw_sugar, 2) if raw_sugar is not None else None,
+        "saturated_fat_g": round(raw_sat_fat, 2) if raw_sat_fat is not None else None,
+        "salt_g": round(raw_salt, 3) if raw_salt is not None else None,
         "sodium_mg": sodium_mg,
-        "calories_kcal": round(_safe_float(raw_kcal, 0.0), 1),
-        "fiber_g": round(_safe_float(nutriments.get("fiber_100g"), 0.0), 2),
-        "protein_g": round(_safe_float(nutriments.get("proteins_100g"), 0.0), 2),
+        "calories_kcal": round(raw_kcal, 1) if raw_kcal is not None else None,
+        "fiber_g": round(raw_fiber, 2) if raw_fiber is not None else None,
+        "protein_g": round(raw_protein, 2) if raw_protein is not None else None,
     }
 
     additives = _extract_e_codes(product.get("additives_tags"))

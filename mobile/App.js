@@ -15,6 +15,7 @@ import {
   View,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as ImagePicker from "expo-image-picker";
 import { API_BASE_URL } from "./config";
 
 const SAMPLE_BARCODES = [
@@ -125,6 +126,13 @@ function getScoreTheme(score) {
   };
 }
 
+function formatNutrientValue(value, unit) {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+  return `${value} ${unit}`;
+}
+
 function ProgressBar({ label, value, max, color }) {
   const ratio = Math.max(0, Math.min(1, (value || 0) / max));
   return (
@@ -154,6 +162,8 @@ export default function App() {
   const [product, setProduct] = useState(null);
   const [recentProducts, setRecentProducts] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [labelAnalyzing, setLabelAnalyzing] = useState(false);
+  const [localLabelImageUri, setLocalLabelImageUri] = useState(null);
   const [recentLoading, setRecentLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [notFoundBarcode, setNotFoundBarcode] = useState(null);
@@ -163,9 +173,12 @@ export default function App() {
   const [methodology, setMethodology] = useState(FALLBACK_METHODOLOGY);
   const [methodologyLoading, setMethodologyLoading] = useState(false);
 
-  // Kamera ve Barkod Tarayıcı state'leri
+  // Kamera ve Barkod Tarayıcı / Etiket Fotoğrafı state'leri
   const [permission, requestPermission] = useCameraPermissions();
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [cameraMode, setCameraMode] = useState("barcode"); // "barcode" | "label_photo"
+  const [labelTargetBarcode, setLabelTargetBarcode] = useState(null);
+  const [capturingPhoto, setCapturingPhoto] = useState(false);
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [scannedLock, setScannedLock] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
@@ -222,6 +235,7 @@ export default function App() {
       setLoading(true);
       setErrorMsg(null);
       setNotFoundBarcode(null);
+      setLocalLabelImageUri(null);
 
       try {
         const response = await fetch(
@@ -267,14 +281,216 @@ export default function App() {
     [barcode, fetchRecentProducts]
   );
 
-  // Kamera ekranını açma
+  // Çekilen veya galeriden seçilen etiket fotoğrafını (base64) backend'e gönderip analiz etme
+  const submitLabelBase64ToBackend = async (
+    base64Data,
+    uriData = null,
+    mimeType = "image/jpeg",
+    associatedBarcode = null
+  ) => {
+    const cleanedBase64 = (base64Data || "").trim();
+    if (!cleanedBase64) {
+      setErrorMsg(
+        "Fotoğraftan görüntü verisi (base64) okunamadı. Lütfen etiketi tekrar çekin."
+      );
+      return;
+    }
+
+    const targetBc =
+      (
+        associatedBarcode ||
+        labelTargetBarcode ||
+        notFoundBarcode ||
+        barcode ||
+        ""
+      ).trim() || null;
+
+    setLabelAnalyzing(true);
+    setErrorMsg(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/analyze-label`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          image_base64: cleanedBase64,
+          mime_type: mimeType || "image/jpeg",
+          barcode: targetBc,
+        }),
+      });
+
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_parseErr) {
+        data = null;
+      }
+
+      if (!response.ok) {
+        setErrorMsg(
+          data?.detail ||
+            `Etiket fotoğrafı analiz edilirken bir hata oluştu (HTTP ${response.status}). Lütfen etiketi daha net ve aydınlık çekin.`
+        );
+        return;
+      }
+
+      setNotFoundBarcode(null);
+      setLocalLabelImageUri(uriData || null);
+      setProduct(data);
+      fetchRecentProducts();
+    } catch (err) {
+      setErrorMsg(
+        `Etiket analizi sırasında sunucuya bağlanılamadı (${API_BASE_URL}). Detay: ${
+          err?.message || "Ağ hatası"
+        }`
+      );
+    } finally {
+      setLabelAnalyzing(false);
+    }
+  };
+
+  // Uygulama içi tam ekran etiket fotoğrafı çekme kamerasını açma
+  const handleOpenLabelCamera = async (associatedBarcode = null) => {
+    Keyboard.dismiss();
+    setErrorMsg(null);
+    const resolvedBc =
+      (associatedBarcode || notFoundBarcode || barcode || "").trim() || null;
+    setLabelTargetBarcode(resolvedBc);
+    scanLockRef.current = false;
+    setScannedLock(false);
+    setCapturingPhoto(false);
+    setTorchEnabled(false);
+    setCameraReady(false);
+    setCameraError(null);
+    setCameraMode("label_photo");
+    setScannerOpen(true);
+
+    if (!permission?.granted) {
+      await requestPermission();
+    }
+  };
+
+  // Uygulama içi CameraView ile etiket fotoğrafı çekip POST /api/analyze-label'a gönderme
+  const handleTakeLabelPicture = async () => {
+    if (capturingPhoto) {
+      return;
+    }
+    if (
+      !cameraRef.current ||
+      typeof cameraRef.current.takePictureAsync !== "function"
+    ) {
+      setCameraError(
+        "Kamera henüz fotoğraf çekmeye hazır değil, lütfen 1 saniye bekleyip tekrar deneyin."
+      );
+      return;
+    }
+
+    setCapturingPhoto(true);
+    setCameraError(null);
+
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.75,
+        base64: true,
+        skipProcessing: false,
+      });
+
+      if (!photo || !photo.base64) {
+        handleCloseScanner();
+        setErrorMsg(
+          "Kameradan fotoğraf verisi (base64) alınamadı. Lütfen tekrar deneyin."
+        );
+        return;
+      }
+
+      const targetBc = labelTargetBarcode;
+      handleCloseScanner();
+      await submitLabelBase64ToBackend(
+        photo.base64,
+        photo.uri || null,
+        "image/jpeg",
+        targetBc
+      );
+    } catch (err) {
+      handleCloseScanner();
+      setErrorMsg(
+        `Fotoğraf çekilirken bir hata oluştu: ${
+          err?.message || "Kamera görüntü yakalayamadı."
+        }`
+      );
+    } finally {
+      setCapturingPhoto(false);
+    }
+  };
+
+  // Etiket fotoğrafı çekerek (uygulama içi CameraView) veya galeriden seçerek analiz etme
+  const handleAnalyzeLabelPhoto = async (
+    mode = "camera",
+    associatedBarcode = null
+  ) => {
+    Keyboard.dismiss();
+    setErrorMsg(null);
+
+    if (mode !== "gallery") {
+      await handleOpenLabelCamera(associatedBarcode);
+      return;
+    }
+
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) {
+        setErrorMsg(
+          "Galeriden etiket fotoğrafı seçebilmek için fotoğraf arşivi izni vermeniz gerekmektedir."
+        );
+        return;
+      }
+
+      const pickerResult = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+        quality: 0.75,
+        base64: true,
+      });
+
+      if (pickerResult.canceled || !pickerResult.assets?.length) {
+        return;
+      }
+
+      const asset = pickerResult.assets[0];
+      if (!asset?.base64) {
+        setErrorMsg(
+          "Seçilen fotoğraftan görüntü verisi (base64) okunamadı. Lütfen başka bir fotoğraf deneyin."
+        );
+        return;
+      }
+
+      await submitLabelBase64ToBackend(
+        asset.base64,
+        asset.uri || null,
+        asset.mimeType || "image/jpeg",
+        associatedBarcode
+      );
+    } catch (err) {
+      setErrorMsg(
+        `Galeriden fotoğraf okunurken hata oluştu: ${
+          err?.message || "Bilinmeyen hata"
+        }`
+      );
+    }
+  };
+
+  // Barkod tarama kamerasını açma
   const handleOpenScanner = async () => {
     Keyboard.dismiss();
     scanLockRef.current = false;
     setScannedLock(false);
+    setCapturingPhoto(false);
     setTorchEnabled(false);
     setCameraReady(false);
     setCameraError(null);
+    setCameraMode("barcode");
     setScannerOpen(true);
 
     if (!permission?.granted) {
@@ -288,6 +504,7 @@ export default function App() {
     setScannerOpen(false);
     setCameraReady(false);
     setCameraError(null);
+    setCapturingPhoto(false);
     scanLockRef.current = false;
     setScannedLock(false);
   };
@@ -328,11 +545,15 @@ export default function App() {
   }, [scannerOpen, permission?.granted]);
 
   const scoreTheme = product ? getScoreTheme(product.score) : null;
+  const isFromLabelPhoto =
+    product?.source === "label_photo" || product?.data_source === "label_photo";
+  const displayImageUri = product?.image_url || localLabelImageUri;
 
   // ---------------------------------------------------------------------------
-  // TAM EKRAN KAMERA GÖRÜNÜMÜ (3 Bölgeli Dengeli Yerleşim)
+  // TAM EKRAN KAMERA GÖRÜNÜMÜ (Barkod Tarama + Etiket Fotoğrafı Çekme Modları)
   // ---------------------------------------------------------------------------
   if (scannerOpen) {
+    const isLabelMode = cameraMode === "label_photo";
     const camWidth = Math.max(1, Math.round(windowWidth || 360));
     const camHeight = Math.max(
       1,
@@ -357,8 +578,9 @@ export default function App() {
             <Text style={styles.permissionIcon}>📷</Text>
             <Text style={styles.permissionTitle}>Kamera İzni Gerekiyor</Text>
             <Text style={styles.permissionSubtext}>
-              Ürün paketleri üzerindeki barkodları kamera ile okutabilmek için
-              kamera erişim izni vermeniz gerekmektedir.
+              {isLabelMode
+                ? "Ürün etiketinin fotoğrafını çekebilmek için kamera erişim izni vermeniz gerekmektedir."
+                : "Ürün paketleri üzerindeki barkodları kamera ile okutabilmek için kamera erişim izni vermeniz gerekmektedir."}
             </Text>
 
             <TouchableOpacity
@@ -396,13 +618,19 @@ export default function App() {
               mode="picture"
               autofocus="on"
               enableTorch={torchEnabled}
-              barcodeScannerSettings={{
-                barcodeTypes: SUPPORTED_BARCODE_TYPES,
-              }}
+              barcodeScannerSettings={
+                isLabelMode
+                  ? undefined
+                  : {
+                      barcodeTypes: SUPPORTED_BARCODE_TYPES,
+                    }
+              }
               onCameraReady={() => {
                 setCameraReady(true);
               }}
-              onBarcodeScanned={scannedLock ? undefined : handleBarcodeScanned}
+              onBarcodeScanned={
+                isLabelMode || scannedLock ? undefined : handleBarcodeScanned
+              }
               onMountError={(event) => {
                 const msg =
                   event?.nativeEvent?.message ||
@@ -417,15 +645,22 @@ export default function App() {
               style={[StyleSheet.absoluteFillObject, styles.cameraOverlayLayer]}
               pointerEvents="box-none"
             >
-              {/* BÖLGE 1 (ÜST): KAPAT VE FENER BUTONLARI */}
+              {/* BÖLGE 1 (ÜST): KAPAT, MOD ROZETİ VE FENER BUTONLARI */}
               <View style={styles.cameraTopBar} pointerEvents="box-none">
                 <TouchableOpacity
                   style={styles.cameraControlBtn}
                   onPress={handleCloseScanner}
+                  disabled={capturingPhoto}
                   activeOpacity={0.8}
                 >
                   <Text style={styles.cameraControlBtnText}>✕ Kapat</Text>
                 </TouchableOpacity>
+
+                <View style={styles.cameraModePill}>
+                  <Text style={styles.cameraModePillText}>
+                    {isLabelMode ? "📸 Etiket Fotoğrafı" : "📷 Barkod Tarayıcı"}
+                  </Text>
+                </View>
 
                 <TouchableOpacity
                   style={[
@@ -433,6 +668,7 @@ export default function App() {
                     torchEnabled && styles.cameraTorchActiveBtn,
                   ]}
                   onPress={() => setTorchEnabled((prev) => !prev)}
+                  disabled={capturingPhoto}
                   activeOpacity={0.8}
                 >
                   <Text
@@ -441,12 +677,12 @@ export default function App() {
                       torchEnabled && styles.cameraTorchActiveText,
                     ]}
                   >
-                    {torchEnabled ? "🔦 Fener Açık" : "🔦 Fener"}
+                    {torchEnabled ? "🔦 Açık" : "🔦 Fener"}
                   </Text>
                 </TouchableOpacity>
               </View>
 
-              {/* BÖLGE 2 (TAM ORTA): YEŞİL TARAMA ÇERÇEVESİ VE LAZER ÇİZGİSİ */}
+              {/* BÖLGE 2 (TAM ORTA): ÇERÇEVE */}
               <View style={styles.viewfinderWrapper} pointerEvents="none">
                 {cameraError && (
                   <View style={styles.cameraErrorBanner}>
@@ -456,26 +692,67 @@ export default function App() {
                   </View>
                 )}
 
-                <View style={styles.viewfinderBox}>
+                <View
+                  style={
+                    isLabelMode
+                      ? styles.labelViewfinderBox
+                      : styles.viewfinderBox
+                  }
+                >
                   <View style={[styles.corner, styles.cornerTopLeft]} />
                   <View style={[styles.corner, styles.cornerTopRight]} />
                   <View style={[styles.corner, styles.cornerBottomLeft]} />
                   <View style={[styles.corner, styles.cornerBottomRight]} />
-                  <View style={styles.scanLaserLine} />
+                  {!isLabelMode && <View style={styles.scanLaserLine} />}
                 </View>
               </View>
 
-              {/* BÖLGE 3 (ALT): YÖNLENDİRME BİLGİ KARTI */}
-              <View style={styles.cameraBottomBar} pointerEvents="none">
-                <View style={styles.cameraHintCard}>
-                  <Text style={styles.cameraHintTitle}>
-                    Barkodu Çerçeveye Hizalayın
-                  </Text>
-                  <Text style={styles.cameraHintSubtitle}>
-                    EAN-13, EAN-8 ve UPC ürün barkodları algılandığında otomatik
-                    olarak analiz başlatılır.
-                  </Text>
-                </View>
+              {/* BÖLGE 3 (ALT): YÖNLENDİRME KARTI VE ETİKET FOTOĞRAF ÇEK BUTONU */}
+              <View style={styles.cameraBottomBar} pointerEvents="box-none">
+                {isLabelMode ? (
+                  <View style={styles.cameraLabelActionCard}>
+                    <Text style={styles.cameraHintTitle}>
+                      İçindekiler ve Besin Değerleri
+                    </Text>
+                    <Text style={styles.cameraHintSubtitle}>
+                      Paketin arkasındaki etiket yazılarını çerçeve içine
+                      netleştirip aşağıdaki butona basın.
+                    </Text>
+
+                    <TouchableOpacity
+                      style={[
+                        styles.capturePhotoBtn,
+                        capturingPhoto && styles.analyzeButtonDisabled,
+                      ]}
+                      onPress={handleTakeLabelPicture}
+                      disabled={capturingPhoto}
+                      activeOpacity={0.85}
+                    >
+                      {capturingPhoto ? (
+                        <View style={styles.buttonLoadingRow}>
+                          <ActivityIndicator color="#FFFFFF" size="small" />
+                          <Text style={styles.capturePhotoBtnText}>
+                            Fotoğraf Çekiliyor...
+                          </Text>
+                        </View>
+                      ) : (
+                        <Text style={styles.capturePhotoBtnText}>
+                          📸 Fotoğraf Çek
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <View style={styles.cameraHintCard} pointerEvents="none">
+                    <Text style={styles.cameraHintTitle}>
+                      Barkodu Çerçeveye Hizalayın
+                    </Text>
+                    <Text style={styles.cameraHintSubtitle}>
+                      EAN-13, EAN-8 ve UPC ürün barkodları algılandığında
+                      otomatik olarak analiz başlatılır.
+                    </Text>
+                  </View>
+                )}
               </View>
             </View>
           </View>
@@ -529,6 +806,7 @@ export default function App() {
           <TouchableOpacity
             style={styles.cameraScanButton}
             onPress={handleOpenScanner}
+            disabled={loading || labelAnalyzing}
             activeOpacity={0.85}
           >
             <Text style={styles.cameraScanIcon}>📷</Text>
@@ -569,9 +847,12 @@ export default function App() {
           </View>
 
           <TouchableOpacity
-            style={[styles.analyzeButton, loading && styles.analyzeButtonDisabled]}
+            style={[
+              styles.analyzeButton,
+              (loading || labelAnalyzing) && styles.analyzeButtonDisabled,
+            ]}
             onPress={() => analyzeBarcode(barcode)}
-            disabled={loading}
+            disabled={loading || labelAnalyzing}
             activeOpacity={0.85}
           >
             {loading ? (
@@ -593,17 +874,61 @@ export default function App() {
                   key={sample.barcode}
                   style={styles.sampleChip}
                   onPress={() => analyzeBarcode(sample.barcode)}
-                  disabled={loading}
+                  disabled={loading || labelAnalyzing}
                 >
                   <Text style={styles.sampleChipText}>{sample.label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
           </View>
+
+          {/* ANA EKRAN ALTINDA ETİKET FOTOĞRAFIYLA ANALİZ SEÇENEĞİ */}
+          <View style={styles.directLabelSection}>
+            <TouchableOpacity
+              style={styles.directLabelBtn}
+              onPress={() => handleAnalyzeLabelPhoto("camera", barcode || null)}
+              disabled={loading || labelAnalyzing}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.directLabelBtnText}>
+                📸 Etiket Fotoğrafı Çekerek Analiz Et
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.directLabelGalleryBtn}
+              onPress={() => handleAnalyzeLabelPhoto("gallery", barcode || null)}
+              disabled={loading || labelAnalyzing}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.directLabelGalleryBtnText}>🖼️ Galeriden</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
-        {/* 404 BULUNAMAYAN ÜRÜN BİLGİ KARTI */}
-        {notFoundBarcode && (
+        {/* ETİKET OKUNUYOR YÜKLENME KARTI */}
+        {labelAnalyzing && (
+          <View style={styles.ocrLoadingCard}>
+            <ActivityIndicator size="large" color="#16A34A" />
+            <Text style={styles.ocrLoadingTitle}>
+              Etiket okunuyor ve analiz ediliyor...
+            </Text>
+            <Text style={styles.ocrLoadingSubtitle}>
+              Fotoğraftaki İçindekiler ve Besin Değerleri tablosu ayrıştırılıp
+              puanlama motorundan geçiriliyor.
+            </Text>
+          </View>
+        )}
+
+        {/* HATA / UYARI KARTI (Fotoğraf Okuma, OCR, 422 veya Bağlantı Hatası) */}
+        {errorMsg && (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorTitle}>Analiz / Bağlantı Uyarısı</Text>
+            <Text style={styles.errorText}>{errorMsg}</Text>
+          </View>
+        )}
+
+        {/* 404 BULUNAMAYAN ÜRÜN BİLGİ KARTI (ETİKET FOTOĞRAFIYLA ANALİZ BUTONLU) */}
+        {notFoundBarcode && !labelAnalyzing && (
           <View style={styles.notFoundCard}>
             <View style={styles.notFoundHeaderRow}>
               <View style={styles.notFoundIconBadge}>
@@ -622,45 +947,78 @@ export default function App() {
             <Text style={styles.notFoundDescription}>
               Okuttuğunuz{" "}
               <Text style={styles.notFoundBold}>#{notFoundBarcode}</Text> barkod
-              numaralı ürün açık gıda veritabanında henüz kayıtlı değil. Çok
-              yakında <Text style={styles.notFoundBold}>"İçindekiler"</Text>{" "}
-              etiketi fotoğrafıyla analiz özelliği eklenecektir.
+              numaralı ürün açık gıda veritabanında henüz kayıtlı değil. Paketin
+              arkasındaki{" "}
+              <Text style={styles.notFoundBold}>
+                "İçindekiler ve Besin Değerleri"
+              </Text>{" "}
+              etiketinin fotoğrafını çekerek hemen analiz edebilirsiniz!
             </Text>
 
+            {/* BİRİNCİL AKSİYON: ETİKET FOTOĞRAFIYLA ANALİZ ET */}
             <TouchableOpacity
-              style={styles.notFoundScanAgainBtn}
-              onPress={handleOpenScanner}
+              style={styles.notFoundLabelPhotoBtn}
+              onPress={() =>
+                handleAnalyzeLabelPhoto("camera", notFoundBarcode)
+              }
               activeOpacity={0.85}
             >
-              <Text style={styles.notFoundScanAgainBtnText}>
-                📷 Başka Ürün Tara
+              <Text style={styles.notFoundLabelPhotoBtnText}>
+                📸 Etiket Fotoğrafıyla Analiz Et
               </Text>
             </TouchableOpacity>
-          </View>
-        )}
 
-        {/* BAĞLANTI / SUNUCU HATASI KARTI (503, Ağ Kopması vb.) */}
-        {errorMsg && (
-          <View style={styles.errorCard}>
-            <Text style={styles.errorTitle}>Bağlantı / Sunucu Uyarısı</Text>
-            <Text style={styles.errorText}>{errorMsg}</Text>
+            <View style={styles.notFoundSecondaryRow}>
+              <TouchableOpacity
+                style={styles.notFoundGalleryBtn}
+                onPress={() =>
+                  handleAnalyzeLabelPhoto("gallery", notFoundBarcode)
+                }
+                activeOpacity={0.85}
+              >
+                <Text style={styles.notFoundGalleryBtnText}>
+                  🖼️ Galeriden Etiket Seç
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.notFoundScanAgainBtn}
+                onPress={handleOpenScanner}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.notFoundScanAgainBtnText}>
+                  📷 Başka Ürün Tara
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
 
         {/* ÜRÜN ANALİZ SONUÇ KARTI */}
-        {product && scoreTheme && (
+        {product && scoreTheme && !labelAnalyzing && (
           <View style={styles.resultCard}>
+            {/* Etiket Fotoğrafından Analiz Edildi Rozeti */}
+            {isFromLabelPhoto && (
+              <View style={styles.labelSourceBanner}>
+                <Text style={styles.labelSourceBannerText}>
+                  📸 Etiket Fotoğrafından Analiz Edildi
+                </Text>
+              </View>
+            )}
+
             {/* Üst Bilgi: Görsel + İsim + Marka */}
             <View style={styles.productTopRow}>
-              {product.image_url ? (
+              {displayImageUri ? (
                 <Image
-                  source={{ uri: product.image_url }}
+                  source={{ uri: displayImageUri }}
                   style={styles.productImage}
-                  resizeMode="contain"
+                  resizeMode="cover"
                 />
               ) : (
                 <View style={styles.productImagePlaceholder}>
-                  <Text style={styles.placeholderText}>Görsel Yok</Text>
+                  <Text style={styles.placeholderText}>
+                    {isFromLabelPhoto ? "Etiket" : "Görsel Yok"}
+                  </Text>
                 </View>
               )}
 
@@ -671,7 +1029,9 @@ export default function App() {
                     style={[
                       styles.cacheTag,
                       {
-                        backgroundColor: product.from_cache
+                        backgroundColor: isFromLabelPhoto
+                          ? "#F3E8FF"
+                          : product.from_cache
                           ? "#E0F2FE"
                           : "#F1F5F9",
                       },
@@ -681,11 +1041,19 @@ export default function App() {
                       style={[
                         styles.cacheTagText,
                         {
-                          color: product.from_cache ? "#0369A1" : "#475569",
+                          color: isFromLabelPhoto
+                            ? "#7E22CE"
+                            : product.from_cache
+                            ? "#0369A1"
+                            : "#475569",
                         },
                       ]}
                     >
-                      {product.from_cache ? "Önbellek" : "Canlı Veri"}
+                      {isFromLabelPhoto
+                        ? "Etiket OCR"
+                        : product.from_cache
+                        ? "Önbellek"
+                        : "Canlı Veri"}
                     </Text>
                   </View>
                 </View>
@@ -791,41 +1159,60 @@ export default function App() {
                 <View style={styles.nutritionGrid}>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.calories_kcal} kcal
+                      {formatNutrientValue(
+                        product.nutrition.calories_kcal,
+                        "kcal"
+                      )}
                     </Text>
                     <Text style={styles.nutritionLabel}>Enerji</Text>
                   </View>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.sugar_g} g
+                      {formatNutrientValue(product.nutrition.sugar_g, "g")}
                     </Text>
                     <Text style={styles.nutritionLabel}>Şeker</Text>
                   </View>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.saturated_fat_g} g
+                      {formatNutrientValue(
+                        product.nutrition.saturated_fat_g,
+                        "g"
+                      )}
                     </Text>
                     <Text style={styles.nutritionLabel}>Doymuş Yağ</Text>
                   </View>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.salt_g} g
+                      {formatNutrientValue(product.nutrition.salt_g, "g")}
                     </Text>
                     <Text style={styles.nutritionLabel}>Tuz</Text>
                   </View>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.fiber_g} g
+                      {formatNutrientValue(product.nutrition.fiber_g, "g")}
                     </Text>
                     <Text style={styles.nutritionLabel}>Lif</Text>
                   </View>
                   <View style={styles.nutritionBox}>
                     <Text style={styles.nutritionValue}>
-                      {product.nutrition.protein_g} g
+                      {formatNutrientValue(product.nutrition.protein_g, "g")}
                     </Text>
                     <Text style={styles.nutritionLabel}>Protein</Text>
                   </View>
                 </View>
+
+                <TouchableOpacity
+                  style={[styles.directLabelBtn, { marginTop: 10 }]}
+                  onPress={() =>
+                    handleAnalyzeLabelPhoto("camera", product.barcode)
+                  }
+                  disabled={loading || labelAnalyzing}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.directLabelBtnText}>
+                    📸 Etiket Fotoğrafıyla Besin Değerlerini Güncelle
+                  </Text>
+                </TouchableOpacity>
               </View>
             )}
 
@@ -863,6 +1250,18 @@ export default function App() {
                       <Text style={styles.eCodeText}>{code}</Text>
                     </View>
                   ))}
+                </View>
+              </View>
+            )}
+
+            {/* İÇİNDEKİLER METNİ (VARSA) */}
+            {product.ingredients_text && (
+              <View style={styles.sectionBlock}>
+                <Text style={styles.blockTitle}>İçindekiler Metni</Text>
+                <View style={styles.ingredientsBox}>
+                  <Text style={styles.ingredientsText}>
+                    {product.ingredients_text}
+                  </Text>
                 </View>
               </View>
             )}
@@ -1285,6 +1684,75 @@ const styles = StyleSheet.create({
     color: "#334155",
     fontWeight: "600",
   },
+  directLabelSection: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#F1F5F9",
+    flexDirection: "row",
+    gap: 8,
+  },
+  directLabelBtn: {
+    flex: 1,
+    backgroundColor: "#F0FDF4",
+    borderWidth: 1,
+    borderColor: "#BBF7D0",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  directLabelBtnText: {
+    fontSize: 12.5,
+    fontWeight: "700",
+    color: "#15803D",
+  },
+  directLabelGalleryBtn: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  directLabelGalleryBtnText: {
+    fontSize: 12.5,
+    fontWeight: "700",
+    color: "#334155",
+  },
+
+  /* ETİKET OCR YÜKLENME KARTI */
+  ocrLoadingCard: {
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1.5,
+    borderColor: "#86EFAC",
+    borderRadius: 20,
+    padding: 22,
+    marginBottom: 18,
+    alignItems: "center",
+    shadowColor: "#16A34A",
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+  },
+  ocrLoadingTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#0F172A",
+    marginTop: 12,
+    marginBottom: 4,
+    textAlign: "center",
+  },
+  ocrLoadingSubtitle: {
+    fontSize: 13,
+    color: "#64748B",
+    textAlign: "center",
+    lineHeight: 19,
+  },
 
   /* 404 BULUNAMAYAN ÜRÜN KARTI STİLLERİ */
   notFoundCard: {
@@ -1343,16 +1811,54 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#0F172A",
   },
-  notFoundScanAgainBtn: {
-    backgroundColor: "#0F172A",
+  notFoundLabelPhotoBtn: {
+    backgroundColor: "#16A34A",
     borderRadius: 14,
-    paddingVertical: 13,
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+    shadowColor: "#16A34A",
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 3,
+  },
+  notFoundLabelPhotoBtnText: {
+    color: "#FFFFFF",
+    fontSize: 15.5,
+    fontWeight: "800",
+  },
+  notFoundSecondaryRow: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  notFoundGalleryBtn: {
+    flex: 1,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 13,
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notFoundGalleryBtnText: {
+    color: "#334155",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  notFoundScanAgainBtn: {
+    flex: 1,
+    backgroundColor: "#0F172A",
+    borderRadius: 13,
+    paddingVertical: 12,
     alignItems: "center",
     justifyContent: "center",
   },
   notFoundScanAgainBtnText: {
     color: "#FFFFFF",
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: "700",
   },
 
@@ -1387,6 +1893,21 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 5 },
     elevation: 3,
+  },
+  labelSourceBanner: {
+    backgroundColor: "#F3E8FF",
+    borderWidth: 1,
+    borderColor: "#D8B4FE",
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 14,
+    alignItems: "center",
+  },
+  labelSourceBannerText: {
+    color: "#6B21A8",
+    fontSize: 12.5,
+    fontWeight: "800",
   },
   productTopRow: {
     flexDirection: "row",
@@ -1653,6 +2174,18 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#334155",
   },
+  ingredientsBox: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    borderRadius: 12,
+    padding: 12,
+  },
+  ingredientsText: {
+    fontSize: 12.5,
+    color: "#334155",
+    lineHeight: 18,
+  },
   disclaimerBox: {
     marginTop: 8,
     backgroundColor: "#F8FAFC",
@@ -1854,6 +2387,19 @@ const styles = StyleSheet.create({
   cameraTorchActiveText: {
     color: "#0F172A",
   },
+  cameraModePill: {
+    backgroundColor: "rgba(15, 23, 42, 0.78)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "rgba(34, 197, 94, 0.45)",
+  },
+  cameraModePillText: {
+    color: "#86EFAC",
+    fontSize: 12.5,
+    fontWeight: "800",
+  },
   cameraErrorBanner: {
     marginHorizontal: 20,
     marginBottom: 16,
@@ -1877,6 +2423,15 @@ const styles = StyleSheet.create({
   viewfinderBox: {
     width: 270,
     height: 180,
+    borderRadius: 20,
+    backgroundColor: "transparent",
+    justifyContent: "center",
+    alignItems: "center",
+    position: "relative",
+  },
+  labelViewfinderBox: {
+    width: 300,
+    height: 280,
     borderRadius: 20,
     backgroundColor: "transparent",
     justifyContent: "center",
@@ -1924,9 +2479,9 @@ const styles = StyleSheet.create({
     opacity: 0.85,
   },
   cameraBottomBar: {
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingTop: 12,
-    paddingBottom: Platform.OS === "android" ? 44 : 52,
+    paddingBottom: Platform.OS === "android" ? 36 : 48,
     backgroundColor: "transparent",
   },
   cameraHintCard: {
@@ -1937,6 +2492,34 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(255, 255, 255, 0.15)",
     alignItems: "center",
+  },
+  cameraLabelActionCard: {
+    backgroundColor: "rgba(15, 23, 42, 0.88)",
+    borderRadius: 20,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.18)",
+    alignItems: "center",
+  },
+  capturePhotoBtn: {
+    marginTop: 14,
+    width: "100%",
+    backgroundColor: "#16A34A",
+    borderRadius: 15,
+    paddingVertical: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#16A34A",
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  capturePhotoBtnText: {
+    color: "#FFFFFF",
+    fontSize: 16.5,
+    fontWeight: "800",
   },
   cameraHintTitle: {
     color: "#FFFFFF",

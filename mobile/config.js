@@ -6,4 +6,4 @@
  * Ağ değişirse aşağıdaki IP adresini bilgisayarınızın güncel Wi-Fi IPv4 adresiyle güncelleyin.
  */
 
-export const API_BASE_URL = "http://192.168.1.106:8001";
+export const API_BASE_URL = "http://10.84.121.170:8001";

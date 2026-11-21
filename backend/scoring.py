@@ -73,6 +73,16 @@ def _determine_grade(score: int) -> str:
     return "Düşük Skor"
 
 
+def _opt_float(value: Any) -> Optional[float]:
+    """Değeri güvenli şekilde pozitif float'a çevirir; None veya boşsa None döndürür."""
+    if value is None or value == "":
+        return None
+    try:
+        return max(0.0, float(value))
+    except (ValueError, TypeError):
+        return None
+
+
 def calculate_product_score(
     nutrition: Optional[Dict[str, Optional[float]]] = None,
     additives: Optional[List[str]] = None,
@@ -97,20 +107,34 @@ def calculate_product_score(
     # 1. BESİN DEĞERLERİ PUANI (%60 -> Maksimum 60 Puan)
     # -------------------------------------------------------------------------
     nutrition_score = 60.0
+    missing_core_nutrients: List[str] = []
 
-    sugar_g = float(nutrition.get("sugar_g") or 0.0)
-    saturated_fat_g = float(nutrition.get("saturated_fat_g") or 0.0)
-    salt_g = float(nutrition.get("salt_g") or 0.0)
-    sodium_mg = float(nutrition.get("sodium_mg") or 0.0)
-    calories_kcal = float(nutrition.get("calories_kcal") or 0.0)
-    fiber_g = float(nutrition.get("fiber_g") or 0.0)
-    protein_g = float(nutrition.get("protein_g") or 0.0)
+    sugar_g = _opt_float(nutrition.get("sugar_g"))
+    saturated_fat_g = _opt_float(nutrition.get("saturated_fat_g"))
+    salt_g = _opt_float(nutrition.get("salt_g"))
+    sodium_mg = _opt_float(nutrition.get("sodium_mg"))
+    calories_kcal = _opt_float(nutrition.get("calories_kcal"))
+    fiber_g = _opt_float(nutrition.get("fiber_g"))
+    protein_g = _opt_float(nutrition.get("protein_g"))
 
     # Tuz verilmemiş ancak sodyum (mg) verilmişse tuza (g) çevir (Tuz = Sodyum * 2.5)
-    effective_salt_g = salt_g if salt_g > 0 else (sodium_mg / 1000.0) * 2.5
+    effective_salt_g: Optional[float]
+    if salt_g is not None and salt_g > 0:
+        effective_salt_g = salt_g
+    elif sodium_mg is not None and sodium_mg > 0:
+        effective_salt_g = (sodium_mg / 1000.0) * 2.5
+    elif salt_g is not None:
+        effective_salt_g = salt_g
+    elif sodium_mg is not None:
+        effective_salt_g = 0.0
+    else:
+        effective_salt_g = None
 
     # Şeker değerlendirmesi (100g başına)
-    if sugar_g > 22.5:
+    if sugar_g is None:
+        nutrition_score -= 9.0
+        missing_core_nutrients.append("şeker")
+    elif sugar_g > 22.5:
         nutrition_score -= 18.0
         warnings.append(f"Yüksek şeker içeriği ({sugar_g:g}g / 100g)")
     elif sugar_g > 10.0:
@@ -120,7 +144,10 @@ def calculate_product_score(
         nutrition_score -= 4.0
 
     # Doymuş yağ değerlendirmesi (100g başına)
-    if saturated_fat_g > 10.0:
+    if saturated_fat_g is None:
+        nutrition_score -= 7.5
+        missing_core_nutrients.append("doymuş yağ")
+    elif saturated_fat_g > 10.0:
         nutrition_score -= 15.0
         warnings.append(f"Yüksek doymuş yağ oranı ({saturated_fat_g:g}g / 100g)")
     elif saturated_fat_g > 5.0:
@@ -130,7 +157,10 @@ def calculate_product_score(
         nutrition_score -= 3.0
 
     # Tuz / Sodyum değerlendirmesi (100g başına)
-    if effective_salt_g > 1.5:
+    if effective_salt_g is None:
+        nutrition_score -= 7.5
+        missing_core_nutrients.append("tuz/sodyum")
+    elif effective_salt_g > 1.5:
         nutrition_score -= 15.0
         warnings.append(f"Yüksek tuz/sodyum içeriği ({effective_salt_g:.2f}g / 100g)")
     elif effective_salt_g > 0.9:
@@ -140,7 +170,10 @@ def calculate_product_score(
         nutrition_score -= 3.0
 
     # Kalori değerlendirmesi (100g başına)
-    if calories_kcal > 450.0:
+    if calories_kcal is None:
+        nutrition_score -= 6.0
+        missing_core_nutrients.append("enerji/kalori")
+    elif calories_kcal > 450.0:
         nutrition_score -= 12.0
         warnings.append(f"Yüksek enerji/kalori yoğunluğu ({calories_kcal:g} kcal / 100g)")
     elif calories_kcal > 300.0:
@@ -148,16 +181,26 @@ def calculate_product_score(
     elif calories_kcal > 150.0:
         nutrition_score -= 2.0
 
-    # Pozitif besin öğeleri: Lif ve Protein ödül puanları (60 puan tavanını aşamaz)
-    if fiber_g >= 6.0:
-        nutrition_score += 6.0
-    elif fiber_g >= 3.0:
-        nutrition_score += 3.0
+    # Pozitif besin öğeleri: Lif ve Protein ödül puanları (yalnızca değer biliniyorsa)
+    if fiber_g is not None:
+        if fiber_g >= 6.0:
+            nutrition_score += 6.0
+        elif fiber_g >= 3.0:
+            nutrition_score += 3.0
 
-    if protein_g >= 10.0:
-        nutrition_score += 6.0
-    elif protein_g >= 5.0:
-        nutrition_score += 3.0
+    if protein_g is not None:
+        if protein_g >= 10.0:
+            nutrition_score += 6.0
+        elif protein_g >= 5.0:
+            nutrition_score += 3.0
+
+    # Eksik temel besin verisi varsa pozitif bonusların eksik veriyi telafi etmesini engelle ve uyarı ekle
+    if missing_core_nutrients:
+        max_allowed_nutrition = max(24.0, 60.0 - (7.5 * len(missing_core_nutrients)))
+        nutrition_score = min(nutrition_score, max_allowed_nutrition)
+        warnings.append(
+            "Bazı besin değerleri (örn. şeker, doymuş yağ) okunamadığı/bulunamadığı için puan sınırlı veriye göre hesaplandı."
+        )
 
     nutrition_score = max(0.0, min(60.0, round(nutrition_score, 1)))
 

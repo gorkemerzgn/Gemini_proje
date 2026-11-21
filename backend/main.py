@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from database import get_cached_product, get_recent_products, init_db, save_product
+from label_analyzer import extract_label_data_from_image
 from openfoodfacts import fetch_product_by_barcode
 from scoring import DEFAULT_DISCLAIMER, calculate_product_score
 
@@ -28,7 +29,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="İrem - Gıda & Etiket Analiz API",
     description="Barkod tarama, yapay zekâ ile etiket analizi ve taklit-tağşiş kontrolü API servisi",
-    version="0.5.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -46,15 +47,15 @@ app.add_middleware(
 # Pydantic Veri Modelleri (/api/score)
 # -----------------------------------------------------------------------------
 class NutritionValues(BaseModel):
-    """100g veya 100ml ürün başına besin değerleri"""
+    """100g veya 100ml ürün başına besin değerleri (okunamayan/eksik alanlar None olarak tutulur)"""
 
-    sugar_g: float = Field(default=0.0, ge=0, description="Şeker miktarı (g / 100g)")
-    saturated_fat_g: float = Field(default=0.0, ge=0, description="Doymuş yağ miktarı (g / 100g)")
-    salt_g: float = Field(default=0.0, ge=0, description="Tuz miktarı (g / 100g)")
-    sodium_mg: float = Field(default=0.0, ge=0, description="Sodyum miktarı (mg / 100g)")
-    calories_kcal: float = Field(default=0.0, ge=0, description="Enerji / Kalori (kcal / 100g)")
-    fiber_g: float = Field(default=0.0, ge=0, description="Lif miktarı (g / 100g)")
-    protein_g: float = Field(default=0.0, ge=0, description="Protein miktarı (g / 100g)")
+    sugar_g: Optional[float] = Field(default=None, ge=0, description="Şeker miktarı (g / 100g)")
+    saturated_fat_g: Optional[float] = Field(default=None, ge=0, description="Doymuş yağ miktarı (g / 100g)")
+    salt_g: Optional[float] = Field(default=None, ge=0, description="Tuz miktarı (g / 100g)")
+    sodium_mg: Optional[float] = Field(default=None, ge=0, description="Sodyum miktarı (mg / 100g)")
+    calories_kcal: Optional[float] = Field(default=None, ge=0, description="Enerji / Kalori (kcal / 100g)")
+    fiber_g: Optional[float] = Field(default=None, ge=0, description="Lif miktarı (g / 100g)")
+    protein_g: Optional[float] = Field(default=None, ge=0, description="Protein miktarı (g / 100g)")
 
 
 class ScoreRequest(BaseModel):
@@ -125,6 +126,10 @@ class ProductAnalysisResponse(BaseModel):
         default=False, description="İçerikte glikoz/fruktoz şurubu tespit edildi mi?"
     )
     data_source: str = Field(default="open_food_facts", description="Veri kaynağı")
+    source: str = Field(
+        default="open_food_facts",
+        description="Veri kaynağı etiketi (open_food_facts veya label_photo)",
+    )
     from_cache: bool = Field(
         default=False,
         description="Ürün verisi yerel SQLite önbelleğinden mi getirildi?",
@@ -138,6 +143,20 @@ class ProductAnalysisResponse(BaseModel):
     disclaimer: str = Field(
         default=DEFAULT_DISCLAIMER,
         description="Bilgilendirme ve yasal sorumluluk reddi metni",
+    )
+
+
+class LabelAnalysisRequest(BaseModel):
+    """Etiket fotoğrafından (OCR) ürün analizi isteği modeli"""
+
+    image_base64: str = Field(description="Base64 formatında ürün etiketi fotoğrafı")
+    mime_type: Optional[str] = Field(
+        default="image/jpeg",
+        description="Görsel MIME türü (image/jpeg, image/png, image/webp)",
+    )
+    barcode: Optional[str] = Field(
+        default=None,
+        description="İsteğe bağlı ürün barkod numarası (verilirse analiz sonucu SQLite önbelleğine kaydedilir)",
     )
 
 
@@ -207,7 +226,7 @@ def read_root():
     """Kök uç noktası - Servis karşılama mesajı"""
     return {
         "message": "Gıda Dedektifi API çalışıyor",
-        "version": "0.5.0",
+        "version": "0.7.0",
         "docs": "/docs",
     }
 
@@ -358,9 +377,12 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
     )
 
     warnings = list(score_result["warnings"])
-    if product_data.get("has_missing_nutrition"):
+    has_score_missing_warn = any(
+        "puan sınırlı veriye göre hesaplandı" in w for w in warnings
+    )
+    if product_data.get("has_missing_nutrition") and not has_score_missing_warn:
         warnings.append(
-            "Bilgi Notu: Bu ürünün bazı besin değeri verileri kaynakta eksik olabilir."
+            "Bilgi Notu: Bu ürünün bazı yardımcı besin değeri verileri (örn. lif/protein) kaynakta belirtilmemiş olabilir."
         )
 
     response_obj = ProductAnalysisResponse(
@@ -374,6 +396,7 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
         has_palm_oil=product_data["has_palm_oil"],
         has_glucose_syrup=product_data["has_glucose_syrup"],
         data_source=product_data["data_source"],
+        source=product_data["data_source"],
         from_cache=False,
         score=score_result["score"],
         grade=score_result["grade"],
@@ -383,4 +406,70 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
     )
 
     save_product(response_obj.model_dump())
+    return response_obj
+
+
+@app.post("/api/analyze-label", response_model=ProductAnalysisResponse)
+async def analyze_product_label(payload: LabelAnalysisRequest) -> ProductAnalysisResponse:
+    """
+    Ürün etiketi fotoğrafından ('İçindekiler' ve 'Besin Değerleri') Hibrit OCR
+    (Ücretsiz Yerel RapidOCR / Gemini Vision) ile yapılandırılmış verileri çıkarır,
+    ardından deterministik puanlama motorumuzdan (`scoring.py`) geçirerek skor, derece,
+    uyarılar ve sorumluluk reddi metniyle döndürür.
+    Eğer `barcode` gönderildiyse sonucu SQLite önbelleğine kaydeder.
+    """
+    cleaned_barcode = (payload.barcode or "").strip() or None
+
+    label_data = await extract_label_data_from_image(
+        image_base64=payload.image_base64,
+        mime_type=payload.mime_type or "image/jpeg",
+        barcode=cleaned_barcode,
+    )
+
+    score_result = calculate_product_score(
+        nutrition=label_data["nutrition"],
+        additives=label_data["additives"],
+        is_adulterated=False,
+        has_palm_oil=label_data["has_palm_oil"],
+        has_glucose_syrup=label_data["has_glucose_syrup"],
+    )
+
+    warnings = list(score_result["warnings"])
+    has_score_missing_warn = any(
+        "puan sınırlı veriye göre hesaplandı" in w for w in warnings
+    )
+    if label_data.get("has_missing_nutrition") and not has_score_missing_warn:
+        warnings.append(
+            "Bilgi Notu: Fotoğraftaki besin değerleri tablosunun bir kısmı görünmüyor veya eksik olabilir."
+        )
+
+    warnings.append(
+        "Bilgi Notu: Bu veriler ürün etiket fotoğrafından optik karakter tanıma (OCR) ile okunmuştur; "
+        "fotoğraf netliği ve ışık koşullarına bağlı olarak değerlerde küçük sapmalar olabilir."
+    )
+
+    response_obj = ProductAnalysisResponse(
+        barcode=label_data["barcode"],
+        product_name=label_data["product_name"],
+        brands=label_data["brands"],
+        image_url=label_data["image_url"],
+        ingredients_text=label_data["ingredients_text"],
+        nutrition=NutritionValues(**label_data["nutrition"]),
+        additives=label_data["additives"],
+        has_palm_oil=label_data["has_palm_oil"],
+        has_glucose_syrup=label_data["has_glucose_syrup"],
+        data_source="label_photo",
+        source="label_photo",
+        from_cache=False,
+        score=score_result["score"],
+        grade=score_result["grade"],
+        warnings=warnings,
+        breakdown=ScoreBreakdown(**score_result["breakdown"]),
+        disclaimer=score_result["disclaimer"],
+    )
+
+    # Gerçek bir barkod numarası gönderildiyse SQLite önbelleğine kaydet
+    if cleaned_barcode and cleaned_barcode != "ETIKET-FOTO":
+        save_product(response_obj.model_dump())
+
     return response_obj

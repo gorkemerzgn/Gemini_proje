@@ -9,7 +9,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "Ürün barkodlarını taramak için kamera izni gerekiyor."
+        "NSCameraUsageDescription": "Ürün barkodlarını ve etiket fotoğraflarını taramak için kamera izni gerekiyor.",
+        "NSPhotoLibraryUsageDescription": "Galeriden ürün etiketi fotoğrafı seçebilmek için fotoğraf arşivi izni gerekiyor."
       }
     },
     "android": {
@@ -28,6 +29,13 @@
         "expo-camera",
         {
           "cameraPermission": "Ürün barkodlarını taramak için kamera izni gerekiyor."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Galeriden ürün etiketi fotoğrafı seçebilmek için galeri erişim izni gerekiyor.",
+          "cameraPermission": "Ürün etiketi fotoğrafı çekebilmek için kamera erişim izni gerekiyor."
         }
       ]
     ],
