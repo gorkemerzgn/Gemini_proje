@@ -12,8 +12,12 @@ import httpx
 from fastapi import HTTPException
 
 OPENFOODFACTS_API_URL = "https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
-USER_AGENT = "IremApp/0.3 (contact@iremapp.local)"
-REQUEST_TIMEOUT_SECONDS = 10.0
+OPENFOODFACTS_PRODUCT_URLS = (
+    "https://world.openfoodfacts.org/api/v2/product/{barcode}.json",
+    "https://tr.openfoodfacts.org/api/v2/product/{barcode}.json",
+)
+USER_AGENT = "IremFoodApp/0.8 (https://github.com/gorkemerzgn/irem)"
+REQUEST_TIMEOUT_SECONDS = 12.0
 
 PALM_OIL_KEYWORDS = (
     "palm yağı",
@@ -193,33 +197,27 @@ def parse_off_product_dict(
 
     # 100g başına besin değerleri
     nutriments: Dict[str, Any] = product.get("nutriments") or {}
+    is_serving_only = str(product.get("nutrition_data_per") or "100g").lower() == "serving"
 
-    # Temel besin alanlarından eksik olan var mı kontrolü
-    core_keys = ("sugars_100g", "saturated-fat_100g", "energy-kcal_100g")
-    has_salt_or_sodium = (
-        nutriments.get("salt_100g") is not None or nutriments.get("sodium_100g") is not None
-    )
-    has_missing_nutrition = (
-        not nutriments
-        or any(nutriments.get(k) is None for k in core_keys)
-        or not has_salt_or_sodium
-        or nutriments.get("fiber_100g") is None
-        or nutriments.get("proteins_100g") is None
-    )
+    def _get_nutr(base_key: str) -> Optional[float]:
+        val = _safe_optional_float(nutriments.get(f"{base_key}_100g"))
+        if val is None and not is_serving_only:
+            val = _safe_optional_float(nutriments.get(base_key))
+        if val is None and not is_serving_only:
+            val = _safe_optional_float(nutriments.get(f"{base_key}_value"))
+        return val
 
     # Kalori değeri energy-kcal_100g yoksa energy-kj_100g / 4.184 üzerinden hesaplanabilir
-    raw_kcal = _safe_optional_float(nutriments.get("energy-kcal_100g"))
+    raw_kcal = _get_nutr("energy-kcal")
     if raw_kcal is None:
-        raw_kj = _safe_optional_float(
-            nutriments.get("energy-kj_100g")
-            if nutriments.get("energy-kj_100g") is not None
-            else nutriments.get("energy_100g")
-        )
+        raw_kj = _get_nutr("energy-kj")
+        if raw_kj is None:
+            raw_kj = _get_nutr("energy")
         if raw_kj is not None:
             raw_kcal = round(raw_kj / 4.184, 1)
 
     # Open Food Facts'te sodium_100g genellikle gram cinsinden tutulur -> mg'a çevir
-    raw_sodium_g = _safe_optional_float(nutriments.get("sodium_100g"))
+    raw_sodium_g = _get_nutr("sodium")
     sodium_mg: Optional[float] = None
     if raw_sodium_g is not None:
         sodium_mg = (
@@ -228,14 +226,23 @@ def parse_off_product_dict(
             else round(raw_sodium_g, 2)
         )
 
-    raw_sugar = _safe_optional_float(nutriments.get("sugars_100g"))
-    raw_sat_fat = _safe_optional_float(nutriments.get("saturated-fat_100g"))
-    raw_salt = _safe_optional_float(nutriments.get("salt_100g"))
+    raw_sugar = _get_nutr("sugars")
+    raw_sat_fat = _get_nutr("saturated-fat")
+    raw_salt = _get_nutr("salt")
     if raw_salt is None and sodium_mg is not None:
         raw_salt = round((sodium_mg / 1000.0) * 2.5, 3)
 
-    raw_fiber = _safe_optional_float(nutriments.get("fiber_100g"))
-    raw_protein = _safe_optional_float(nutriments.get("proteins_100g"))
+    raw_fiber = _get_nutr("fiber")
+    raw_protein = _get_nutr("proteins")
+
+    has_salt_or_sodium = raw_salt is not None or sodium_mg is not None
+    has_missing_nutrition = (
+        not nutriments
+        or any(v is None for v in (raw_sugar, raw_sat_fat, raw_kcal))
+        or not has_salt_or_sodium
+        or raw_fiber is None
+        or raw_protein is None
+    )
 
     nutrition = {
         "sugar_g": round(raw_sugar, 2) if raw_sugar is not None else None,
@@ -248,6 +255,18 @@ def parse_off_product_dict(
     }
 
     additives = _extract_e_codes(product.get("additives_tags"))
+    if combined_ingredients_for_analysis:
+        for m in re.finditer(
+            r"\bE[-\s]?(\d{3,4})[a-zA-Z]?\b",
+            combined_ingredients_for_analysis,
+            flags=re.IGNORECASE,
+        ):
+            num = int(m.group(1))
+            if 100 <= num <= 1599:
+                code = f"E{num}"
+                if code not in additives:
+                    additives.append(code)
+
     flags = _detect_ingredient_flags(product, combined_ingredients_for_analysis)
 
     return {
@@ -265,53 +284,189 @@ def parse_off_product_dict(
     }
 
 
-async def fetch_product_by_barcode(barcode: str) -> Dict[str, Any]:
+def _merge_parsed_off_products(
+    primary: Dict[str, Any],
+    secondary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """İki OFF kaynağından (world ve tr) gelen ürün verilerini birleştirerek eksik alanları tamamlar."""
+    merged = dict(primary)
+    if (
+        not merged.get("product_name")
+        or merged.get("product_name") == "İsimsiz Ürün"
+    ) and secondary.get("product_name"):
+        merged["product_name"] = secondary["product_name"]
+
+    for field in ("brands", "image_url", "ingredients_text"):
+        if not merged.get(field) and secondary.get(field):
+            merged[field] = secondary[field]
+
+    merged_nutr = dict(merged.get("nutrition") or {})
+    sec_nutr = secondary.get("nutrition") or {}
+    for k, v in sec_nutr.items():
+        if merged_nutr.get(k) is None and v is not None:
+            merged_nutr[k] = v
+    merged["nutrition"] = merged_nutr
+
+    merged_add = list(merged.get("additives") or [])
+    for code in secondary.get("additives") or []:
+        if code not in merged_add:
+            merged_add.append(code)
+    merged["additives"] = merged_add
+
+    merged["has_palm_oil"] = bool(
+        merged.get("has_palm_oil") or secondary.get("has_palm_oil")
+    )
+    merged["has_glucose_syrup"] = bool(
+        merged.get("has_glucose_syrup") or secondary.get("has_glucose_syrup")
+    )
+
+    core_vals = (
+        merged_nutr.get("sugar_g"),
+        merged_nutr.get("saturated_fat_g"),
+        merged_nutr.get("calories_kcal"),
+    )
+    has_salt = (
+        merged_nutr.get("salt_g") is not None
+        or merged_nutr.get("sodium_mg") is not None
+    )
+    merged["has_missing_nutrition"] = (
+        any(v is None for v in core_vals)
+        or not has_salt
+        or merged_nutr.get("fiber_g") is None
+        or merged_nutr.get("protein_g") is None
+    )
+    return merged
+
+
+def _has_complete_core_and_ingredients(parsed: Dict[str, Any]) -> bool:
+    """Ürünün 4 temel besin değerinin ve içindekiler metninin tam olup olmadığını kontrol eder."""
+    n = parsed.get("nutrition") or {}
+    has_all_core = all(
+        n.get(k) is not None
+        for k in ("sugar_g", "saturated_fat_g", "salt_g", "calories_kcal")
+    )
+    return has_all_core and bool(parsed.get("ingredients_text"))
+
+
+def fetch_product_by_barcode_sync(
+    barcode: str,
+    client: Optional[httpx.Client] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Verilen barkod numarası ile Open Food Facts v2 API'sinden ürün verisini çeker
-    ve puanlama motoruna uygun standart yapıda döndürür.
+    Senkron olarak `world.openfoodfacts.org` ve gerekirse `tr.openfoodfacts.org`
+    ürün detay uçlarından barkod verisini çeker ve birleştirir. Bulunamazsa None döner.
     """
-    cleaned_barcode = barcode.strip()
-    url = OPENFOODFACTS_API_URL.format(barcode=cleaned_barcode)
+    cleaned_barcode = (barcode or "").strip()
+    if not cleaned_barcode:
+        return None
+
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(url, headers=headers)
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Dış ürün veri kaynağına (Open Food Facts) şu anda ulaşılamıyor. Lütfen daha sonra tekrar deneyiniz.",
-        ) from exc
+    best_parsed: Optional[Dict[str, Any]] = None
 
-    if response.status_code == 404:
+    def _query_all(http_client: httpx.Client) -> Optional[Dict[str, Any]]:
+        for url_tpl in OPENFOODFACTS_PRODUCT_URLS:
+            url = url_tpl.format(barcode=cleaned_barcode)
+            try:
+                resp = http_client.get(url, headers=headers)
+            except httpx.RequestError:
+                continue
+
+            if resp.status_code == 404:
+                return None
+
+            if resp.status_code != 200:
+                continue
+
+            try:
+                payload = resp.json()
+            except ValueError:
+                continue
+
+            if payload.get("status") == 0 or not isinstance(payload.get("product"), dict):
+                return None
+
+            return parse_off_product_dict(
+                payload["product"], default_barcode=cleaned_barcode
+            )
+
+        return None
+
+    if client is not None:
+        return _query_all(client)
+
+    with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True) as temp_client:
+        return _query_all(temp_client)
+
+
+async def fetch_product_by_barcode(barcode: str) -> Dict[str, Any]:
+    """
+    Verilen barkod numarası ile Open Food Facts v2 API'sinden (`world` ve gerekirse `tr`)
+    ürün verisini asenkron olarak çeker ve puanlama motoruna uygun standart yapıda döndürür.
+    """
+    cleaned_barcode = barcode.strip()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+
+    best_parsed: Optional[Dict[str, Any]] = None
+    saw_not_found = False
+    last_network_or_server_error = False
+
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True
+    ) as client:
+        for url_tpl in OPENFOODFACTS_PRODUCT_URLS:
+            url = url_tpl.format(barcode=cleaned_barcode)
+            try:
+                response = await client.get(url, headers=headers)
+            except httpx.RequestError:
+                last_network_or_server_error = True
+                continue
+
+            if response.status_code == 404:
+                saw_not_found = True
+                continue
+
+            if response.status_code != 200:
+                last_network_or_server_error = True
+                continue
+
+            try:
+                payload = response.json()
+            except ValueError:
+                last_network_or_server_error = True
+                continue
+
+            if payload.get("status") == 0 or not isinstance(payload.get("product"), dict):
+                saw_not_found = True
+                continue
+
+            parsed = parse_off_product_dict(
+                payload["product"], default_barcode=cleaned_barcode
+            )
+            best_parsed = (
+                parsed
+                if best_parsed is None
+                else _merge_parsed_off_products(best_parsed, parsed)
+            )
+            if _has_complete_core_and_ingredients(best_parsed):
+                break
+
+    if best_parsed is not None:
+        return best_parsed
+
+    if saw_not_found:
         raise HTTPException(
             status_code=404,
             detail=f"'{cleaned_barcode}' barkod numarasına ait ürün kaydı açık veri kaynağında bulunamadı.",
         )
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=503,
-            detail="Dış ürün veri kaynağı (Open Food Facts) geçici olarak yanıt vermiyor veya istek sınırına ulaşıldı.",
-        )
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Dış ürün veri kaynağından geçersiz yanıt alındı.",
-        ) from exc
-
-    # Open Food Facts ürün bulunamadığında HTTP 200 veya 404 ile status=0 dönebilir
-    if payload.get("status") == 0 or not payload.get("product"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{cleaned_barcode}' barkod numarasına ait ürün kaydı açık veri kaynağında bulunamadı.",
-        )
-
-    product: Dict[str, Any] = payload["product"]
-    return parse_off_product_dict(product, default_barcode=cleaned_barcode)
+    raise HTTPException(
+        status_code=503,
+        detail="Dış ürün veri kaynağına (Open Food Facts) şu anda ulaşılamıyor. Lütfen daha sonra tekrar deneyiniz.",
+    )

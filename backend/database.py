@@ -148,14 +148,23 @@ def save_product(
 
     product_name = str(product_data.get("product_name") or "İsimsiz Ürün")
     brands = product_data.get("brands")
-    score = int(product_data.get("score", 0))
-    grade = str(product_data.get("grade") or "Orta")
+    raw_score = product_data.get("score")
+    insufficient = bool(product_data.get("insufficient_data") or raw_score is None)
+    db_score = -1 if insufficient else int(raw_score)
+    grade = (
+        "Yetersiz Veri"
+        if insufficient
+        else str(product_data.get("grade") or "Orta")
+    )
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # Önbelleğe kaydedilen JSON'un daima tutarlı olması için kopyasını al
     stored_payload = dict(product_data)
     stored_payload["from_cache"] = False
+    stored_payload["insufficient_data"] = insufficient
+    stored_payload["score"] = None if insufficient else int(raw_score)
+    stored_payload["grade"] = grade
     response_json_str = json.dumps(stored_payload, ensure_ascii=False)
 
     with closing(_get_connection(db_path)) as conn:
@@ -178,7 +187,7 @@ def save_product(
                 barcode,
                 product_name,
                 brands,
-                score,
+                db_score,
                 grade,
                 response_json_str,
                 now_iso,
@@ -211,9 +220,14 @@ def get_recent_products(
     recent_list: List[Dict[str, Any]] = []
     for row in rows:
         image_url = None
+        parsed_score = row["score"]
+        parsed_grade = row["grade"]
+        insufficient = parsed_score is None or int(parsed_score) < 0 or parsed_grade == "Yetersiz Veri"
         try:
             parsed = json.loads(row["response_json"])
             image_url = parsed.get("image_url")
+            if parsed.get("insufficient_data") or parsed.get("score") is None:
+                insufficient = True
         except ValueError:
             pass
 
@@ -223,8 +237,9 @@ def get_recent_products(
                 "product_name": row["product_name"],
                 "brands": row["brands"],
                 "image_url": image_url,
-                "score": row["score"],
-                "grade": row["grade"],
+                "score": None if insufficient else int(parsed_score),
+                "grade": "Yetersiz Veri" if insufficient else parsed_grade,
+                "insufficient_data": insufficient,
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
@@ -256,8 +271,8 @@ def is_label_photo_product(
 
     try:
         parsed = json.loads(row["response_json"])
-        source = parsed.get("data_source") or parsed.get("source")
-        return source == "label_photo"
+        source = parsed.get("source") or parsed.get("data_source")
+        return source in ("label_photo", "Etiket Fotoğrafı (OCR)")
     except ValueError:
         return False
 
@@ -281,12 +296,12 @@ def get_database_stats(
         try:
             parsed = json.loads(row["response_json"])
             source = str(
-                parsed.get("data_source") or parsed.get("source") or "open_food_facts"
+                parsed.get("source") or parsed.get("data_source") or "open_food_facts"
             )
         except ValueError:
             pass
 
-        if source == "label_photo":
+        if source in ("label_photo", "Etiket Fotoğrafı (OCR)"):
             label_photo_count += 1
         else:
             open_food_facts_count += 1
@@ -347,26 +362,67 @@ def search_products_by_text(
     for row in rows:
         image_url = None
         data_source = "open_food_facts"
+        parsed_score = row["score"]
+        parsed_grade = row["grade"]
+        insufficient = parsed_score is None or int(parsed_score) < 0 or parsed_grade == "Yetersiz Veri"
         try:
             parsed = json.loads(row["response_json"])
             image_url = parsed.get("image_url")
             data_source = str(
                 parsed.get("data_source") or parsed.get("source") or "open_food_facts"
             )
+            if parsed.get("insufficient_data") or parsed.get("score") is None:
+                insufficient = True
         except ValueError:
             pass
 
+        final_grade = "Yetersiz Veri" if insufficient else parsed_grade
         results.append(
             {
                 "barcode": row["barcode"],
                 "product_name": row["product_name"],
                 "brands": row["brands"],
-                "score": row["score"],
-                "score_label": row["grade"],
-                "grade": row["grade"],
+                "score": None if insufficient else int(parsed_score),
+                "score_label": final_grade,
+                "grade": final_grade,
+                "insufficient_data": insufficient,
                 "image_url": image_url,
                 "data_source": data_source,
             }
         )
 
     return results
+
+
+def is_cached_product_missing_nutrition(cached: Dict[str, Any]) -> bool:
+    """
+    Yerel SQLite önbelleğindeki ürünün temel besin değerlerinin veya içindekiler
+    bilgisinin eksik/boş olup olmadığını ve dış kaynaktan zenginleştirilmeye
+    uygun olup olmadığını (`label_photo` değilse) kontrol eder.
+    """
+    if not isinstance(cached, dict):
+        return False
+
+    raw_src = str(cached.get("source") or cached.get("data_source") or "open_food_facts")
+    if raw_src in ("label_photo", "Etiket Fotoğrafı (OCR)"):
+        return False
+
+    nutr = cached.get("nutrition") or {}
+    known_core = sum(
+        1
+        for k in ("sugar_g", "saturated_fat_g", "salt_g", "calories_kcal")
+        if nutr.get(k) is not None
+    )
+    known_risk = sum(
+        1
+        for k in ("sugar_g", "saturated_fat_g", "salt_g")
+        if nutr.get(k) is not None
+    )
+
+    if known_core == 0 or (known_risk == 0 and known_core <= 1):
+        return True
+
+    if known_core < 4 or not cached.get("ingredients_text"):
+        return True
+
+    return False

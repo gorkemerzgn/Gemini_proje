@@ -93,7 +93,21 @@ const FALLBACK_METHODOLOGY = {
 /**
  * Puana (0-100) göre Yuka tarzı renk paleti döndürür
  */
-function getScoreTheme(score) {
+function getScoreTheme(score, insufficientData = false) {
+  if (
+    insufficientData ||
+    score === null ||
+    score === undefined ||
+    Number(score) < 0
+  ) {
+    return {
+      primary: "#475569",
+      softBg: "#F1F5F9",
+      border: "#CBD5E1",
+      dot: "#64748B",
+      isInsufficient: true,
+    };
+  }
   if (score >= 80) {
     return {
       primary: "#16A34A",
@@ -133,6 +147,35 @@ function formatNutrientValue(value, unit) {
   return `${value} ${unit}`;
 }
 
+function getImpactBadgeStyle(impact) {
+  const num = Number(impact) || 0;
+  if (num > 0) {
+    return {
+      bg: "#DCFCE7",
+      border: "#86EFAC",
+      text: "#15803D",
+      label: `+${num} puan`,
+    };
+  }
+  if (num < 0) {
+    return {
+      bg: "#FEE2E2",
+      border: "#FCA5A5",
+      text: "#B91C1C",
+      label: `${num} puan`,
+    };
+  }
+  return {
+    bg: "#F1F5F9",
+    border: "#CBD5E1",
+    text: "#475569",
+    label: "0 puan",
+  };
+}
+
+const TRANSPARENCY_LEGAL_NOTE =
+  "Bu puan yalnızca paylaşılan 100g etiket verilerine dayalı otomatik bir hesaplamadır; tıbbi tavsiye veya marka değerlendirmesi niteliği taşımaz. Kesin bilgi için ürün ambalajını kontrol ediniz.";
+
 function ProgressBar({ label, value, max, color }) {
   const ratio = Math.max(0, Math.min(1, (value || 0) / max));
   return (
@@ -169,6 +212,7 @@ export default function App() {
   const [recentLoading, setRecentLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [notFoundBarcode, setNotFoundBarcode] = useState(null);
+  const [breakdownExpanded, setBreakdownExpanded] = useState(true);
 
   // Metodoloji Modal state'leri
   const [methodologyVisible, setMethodologyVisible] = useState(false);
@@ -623,9 +667,22 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [scannerOpen, permission?.granted]);
 
-  const scoreTheme = product ? getScoreTheme(product.score) : null;
+  const isInsufficientProduct = Boolean(
+    product?.insufficient_data ||
+      product?.score === null ||
+      product?.score === undefined ||
+      product?.grade === "Yetersiz Veri"
+  );
+  const scoreTheme = product
+    ? getScoreTheme(product.score, isInsufficientProduct)
+    : null;
   const isFromLabelPhoto =
-    product?.source === "label_photo" || product?.data_source === "label_photo";
+    product?.source === "label_photo" ||
+    product?.data_source === "label_photo" ||
+    product?.data_source === "Etiket Fotoğrafı (OCR)";
+  const readableDataSource = isFromLabelPhoto
+    ? "Etiket Fotoğrafı (OCR)"
+    : "Open Food Facts";
   const displayImageUri = product?.image_url || localLabelImageUri;
 
   // ---------------------------------------------------------------------------
@@ -1028,7 +1085,17 @@ export default function App() {
               </View>
             ) : (
               searchResults.map((item) => {
-                const itemTheme = getScoreTheme(item.score);
+                const isItemInsufficient = Boolean(
+                  item.insufficient_data ||
+                    item.score === null ||
+                    item.score === undefined ||
+                    item.grade === "Yetersiz Veri" ||
+                    item.score_label === "Yetersiz Veri"
+                );
+                const itemTheme = getScoreTheme(
+                  item.score,
+                  isItemInsufficient
+                );
                 const labelText = item.score_label || item.grade;
                 return (
                   <TouchableOpacity
@@ -1079,7 +1146,9 @@ export default function App() {
                           { color: itemTheme.primary },
                         ]}
                       >
-                        {item.score} • {labelText}
+                        {isItemInsufficient
+                          ? "Yetersiz Veri"
+                          : `${item.score} • ${labelText}`}
                       </Text>
                     </View>
                   </TouchableOpacity>
@@ -1215,9 +1284,7 @@ export default function App() {
                       {
                         backgroundColor: isFromLabelPhoto
                           ? "#F3E8FF"
-                          : product.from_cache
-                          ? "#E0F2FE"
-                          : "#F1F5F9",
+                          : "#E0F2FE",
                       },
                     ]}
                   >
@@ -1225,19 +1292,11 @@ export default function App() {
                       style={[
                         styles.cacheTagText,
                         {
-                          color: isFromLabelPhoto
-                            ? "#7E22CE"
-                            : product.from_cache
-                            ? "#0369A1"
-                            : "#475569",
+                          color: isFromLabelPhoto ? "#7E22CE" : "#0369A1",
                         },
                       ]}
                     >
-                      {isFromLabelPhoto
-                        ? "Etiket OCR"
-                        : product.from_cache
-                        ? "Önbellek"
-                        : "Canlı Veri"}
+                      Kaynak: {readableDataSource}
                     </Text>
                   </View>
                 </View>
@@ -1249,53 +1308,101 @@ export default function App() {
               </View>
             </View>
 
-            {/* YUKA TARZI SKOR ROZETİ VE DERECE */}
-            <View
-              style={[
-                styles.scoreBanner,
-                {
-                  backgroundColor: scoreTheme.softBg,
-                  borderColor: scoreTheme.border,
-                },
-              ]}
-            >
+            {/* SKOR ROZETİ VEYA YETERSİZ VERİ GÖSTERGESİ */}
+            {isInsufficientProduct ? (
+              <View style={styles.insufficientBannerBox}>
+                <View style={styles.insufficientTopRow}>
+                  <View style={styles.insufficientCircle}>
+                    <Text style={styles.insufficientCircleIcon}>—</Text>
+                    <Text style={styles.insufficientCircleSub}>VERİ YOK</Text>
+                  </View>
+
+                  <View style={styles.scoreGradeContainer}>
+                    <Text style={styles.scoreGradeLabel}>Değerlendirme</Text>
+                    <View style={styles.gradePillRow}>
+                      <View
+                        style={[
+                          styles.gradeDot,
+                          { backgroundColor: "#64748B" },
+                        ]}
+                      />
+                      <Text
+                        style={[
+                          styles.scoreGradeValue,
+                          { color: "#334155", fontSize: 18 },
+                        ]}
+                      >
+                        Veri Yok / Hesaplanamadı
+                      </Text>
+                    </View>
+                    <Text style={styles.scoreSubtext}>
+                      Bu ürün için besin değerleri veritabanında bulunmadığından
+                      puan hesaplanamadı.
+                    </Text>
+                  </View>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.addLabelForMissingBtn}
+                  onPress={() =>
+                    handleAnalyzeLabelPhoto("camera", product.barcode)
+                  }
+                  disabled={loading || labelAnalyzing}
+                  activeOpacity={0.85}
+                >
+                  <Text style={styles.addLabelForMissingBtnText}>
+                    📸 Etiket Fotoğrafı Çekerek Besin Değerlerini Ekle
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
               <View
                 style={[
-                  styles.scoreCircle,
-                  { borderColor: scoreTheme.primary },
+                  styles.scoreBanner,
+                  {
+                    backgroundColor: scoreTheme.softBg,
+                    borderColor: scoreTheme.border,
+                  },
                 ]}
               >
-                <Text
-                  style={[styles.scoreNumber, { color: scoreTheme.primary }]}
+                <View
+                  style={[
+                    styles.scoreCircle,
+                    { borderColor: scoreTheme.primary },
+                  ]}
                 >
-                  {product.score}
-                </Text>
-                <Text style={styles.scoreMaxText}>/ 100</Text>
-              </View>
-
-              <View style={styles.scoreGradeContainer}>
-                <Text style={styles.scoreGradeLabel}>Değerlendirme</Text>
-                <View style={styles.gradePillRow}>
-                  <View
-                    style={[
-                      styles.gradeDot,
-                      { backgroundColor: scoreTheme.dot },
-                    ]}
-                  />
                   <Text
-                    style={[
-                      styles.scoreGradeValue,
-                      { color: scoreTheme.primary },
-                    ]}
+                    style={[styles.scoreNumber, { color: scoreTheme.primary }]}
                   >
-                    {product.grade}
+                    {product.score}
+                  </Text>
+                  <Text style={styles.scoreMaxText}>/ 100</Text>
+                </View>
+
+                <View style={styles.scoreGradeContainer}>
+                  <Text style={styles.scoreGradeLabel}>Değerlendirme</Text>
+                  <View style={styles.gradePillRow}>
+                    <View
+                      style={[
+                        styles.gradeDot,
+                        { backgroundColor: scoreTheme.dot },
+                      ]}
+                    />
+                    <Text
+                      style={[
+                        styles.scoreGradeValue,
+                        { color: scoreTheme.primary },
+                      ]}
+                    >
+                      {product.grade}
+                    </Text>
+                  </View>
+                  <Text style={styles.scoreSubtext}>
+                    Besin değerleri, katkı maddeleri ve içerik analizi
                   </Text>
                 </View>
-                <Text style={styles.scoreSubtext}>
-                  Besin değerleri, katkı maddeleri ve içerik analizi
-                </Text>
               </View>
-            </View>
+            )}
 
             {/* SONUÇ KARTI İÇİ METODOLOJİ / KAYNAKLAR BUTONU */}
             <TouchableOpacity
@@ -1309,28 +1416,161 @@ export default function App() {
               <Text style={styles.cardMethodologyArrow}>›</Text>
             </TouchableOpacity>
 
-            {/* PUAN KIRILIMI (BREAKDOWN) */}
-            {product.breakdown && (
+            {/* PUAN KIRILIMI VE ŞEFFAFLIK KARTI */}
+            {(product.breakdown ||
+              (Array.isArray(product.score_breakdown) &&
+                product.score_breakdown.length > 0)) && (
               <View style={styles.sectionBlock}>
-                <Text style={styles.blockTitle}>Puan Kırılımı</Text>
-                <ProgressBar
-                  label="Besin Değerleri (%60)"
-                  value={product.breakdown.nutrition_score}
-                  max={product.breakdown.nutrition_max || 60}
-                  color="#0EA5E9"
-                />
-                <ProgressBar
-                  label="Katkı Maddeleri (%30)"
-                  value={product.breakdown.additives_score}
-                  max={product.breakdown.additives_max || 30}
-                  color="#8B5CF6"
-                />
-                <ProgressBar
-                  label="İçerik Profili (%10)"
-                  value={product.breakdown.clean_content_score}
-                  max={product.breakdown.clean_content_max || 10}
-                  color="#10B981"
-                />
+                <View style={styles.breakdownHeaderRow}>
+                  <Text style={[styles.blockTitle, { marginBottom: 0 }]}>
+                    Puan Kırılımı ve Şeffaflık
+                  </Text>
+                  <TouchableOpacity
+                    style={styles.breakdownToggleBtn}
+                    onPress={() => setBreakdownExpanded((prev) => !prev)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.breakdownToggleBtnText}>
+                      {breakdownExpanded ? "Detayı Gizle ▲" : "Detayı Gör ▼"}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.transparencySourceRow}>
+                  <View style={styles.sourceInfoChip}>
+                    <Text style={styles.sourceInfoChipText}>
+                      Kaynak: {readableDataSource}
+                    </Text>
+                  </View>
+                  {typeof product.missing_fields_count === "number" &&
+                    product.missing_fields_count > 0 && (
+                      <View style={styles.missingCountChip}>
+                        <Text style={styles.missingCountChipText}>
+                          Eksik Veri: {product.missing_fields_count} alan
+                        </Text>
+                      </View>
+                    )}
+                </View>
+
+                {!isInsufficientProduct && product.breakdown && (
+                  <View style={{ marginTop: 8 }}>
+                    <ProgressBar
+                      label="Besin Değerleri (%60)"
+                      value={product.breakdown.nutrition_score}
+                      max={product.breakdown.nutrition_max || 60}
+                      color="#0EA5E9"
+                    />
+                    <ProgressBar
+                      label="Katkı Maddeleri (%30)"
+                      value={product.breakdown.additives_score}
+                      max={product.breakdown.additives_max || 30}
+                      color="#8B5CF6"
+                    />
+                    <ProgressBar
+                      label="İçerik Profili (%10)"
+                      value={product.breakdown.clean_content_score}
+                      max={product.breakdown.clean_content_max || 10}
+                      color="#10B981"
+                    />
+                  </View>
+                )}
+
+                {breakdownExpanded &&
+                  Array.isArray(product.score_breakdown) &&
+                  product.score_breakdown.length > 0 && (
+                    <View style={styles.breakdownDetailBox}>
+                      {/* Başlangıç Puanı Satırı */}
+                      {!isInsufficientProduct && (
+                        <View style={styles.breakdownStartRow}>
+                          <Text style={styles.breakdownStartLabel}>
+                            Başlangıç Referans Puanı
+                          </Text>
+                          <View style={styles.breakdownStartBadge}>
+                            <Text style={styles.breakdownStartBadgeText}>
+                              100 puan
+                            </Text>
+                          </View>
+                        </View>
+                      )}
+
+                      {/* Kalem Bazlı Artı / Eksi / Nötr Etki Listesi */}
+                      {product.score_breakdown.map((item, idx) => {
+                        const badge = getImpactBadgeStyle(item.impact);
+                        return (
+                          <View
+                            key={`${item.label}-${idx}`}
+                            style={styles.breakdownItemRow}
+                          >
+                            <View style={styles.breakdownItemLeft}>
+                              <View style={styles.breakdownItemTitleRow}>
+                                <Text style={styles.breakdownItemLabel}>
+                                  {item.label}
+                                </Text>
+                                <View style={styles.breakdownValuePill}>
+                                  <Text style={styles.breakdownValuePillText}>
+                                    {item.value_text}
+                                  </Text>
+                                </View>
+                              </View>
+                              <Text style={styles.breakdownItemReason}>
+                                {item.reason}
+                              </Text>
+                            </View>
+
+                            {!isInsufficientProduct && (
+                              <View
+                                style={[
+                                  styles.breakdownImpactBadge,
+                                  {
+                                    backgroundColor: badge.bg,
+                                    borderColor: badge.border,
+                                  },
+                                ]}
+                              >
+                                <Text
+                                  style={[
+                                    styles.breakdownImpactText,
+                                    { color: badge.text },
+                                  ]}
+                                >
+                                  {badge.label}
+                                </Text>
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })}
+
+                      {/* Eksik Veri / Resmi Duyuru Puan Tavanı Uyarısı */}
+                      {product.cap_applied && product.cap_reason && (
+                        <View style={styles.capNoticeBox}>
+                          <Text style={styles.capNoticeTitle}>
+                            ⚖️ Puan Tavanı Uygulandı
+                          </Text>
+                          <Text style={styles.capNoticeText}>
+                            {product.cap_reason}
+                          </Text>
+                        </View>
+                      )}
+
+                      {/* Nihai Puan Özeti Satırı */}
+                      <View style={styles.breakdownFinalRow}>
+                        <Text style={styles.breakdownFinalLabel}>
+                          Hesaplanan Nihai Puan
+                        </Text>
+                        <Text
+                          style={[
+                            styles.breakdownFinalValue,
+                            { color: scoreTheme.primary },
+                          ]}
+                        >
+                          {isInsufficientProduct
+                            ? "Veri Yok / Hesaplanamadı"
+                            : `${product.score} / 100 (${product.grade})`}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
               </View>
             )}
 
@@ -1450,12 +1690,12 @@ export default function App() {
               </View>
             )}
 
-            {/* YASAL SORUMLULUK REDDİ (DISCLAIMER) */}
-            {product.disclaimer && (
-              <View style={styles.disclaimerBox}>
-                <Text style={styles.disclaimerText}>{product.disclaimer}</Text>
-              </View>
-            )}
+            {/* YASAL SORUMLULUK REDDİ VE ŞEFFAFLIK NOTU (DISCLAIMER) */}
+            <View style={styles.disclaimerBox}>
+              <Text style={styles.disclaimerText}>
+                {TRANSPARENCY_LEGAL_NOTE}
+              </Text>
+            </View>
           </View>
         )}
 
@@ -1482,7 +1722,13 @@ export default function App() {
             </View>
           ) : (
             recentProducts.map((item) => {
-              const itemTheme = getScoreTheme(item.score);
+              const isItemInsufficient = Boolean(
+                item.insufficient_data ||
+                  item.score === null ||
+                  item.score === undefined ||
+                  item.grade === "Yetersiz Veri"
+              );
+              const itemTheme = getScoreTheme(item.score, isItemInsufficient);
               return (
                 <TouchableOpacity
                   key={item.barcode}
@@ -1532,7 +1778,9 @@ export default function App() {
                         { color: itemTheme.primary },
                       ]}
                     >
-                      {item.score} • {item.grade}
+                      {isItemInsufficient
+                        ? "Yetersiz Veri"
+                        : `${item.score} • ${item.grade}`}
                     </Text>
                   </View>
                 </TouchableOpacity>
@@ -2156,6 +2404,60 @@ const styles = StyleSheet.create({
     fontWeight: "500",
     marginTop: 2,
   },
+  insufficientBannerBox: {
+    backgroundColor: "#F1F5F9",
+    borderColor: "#CBD5E1",
+    borderWidth: 1.5,
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 12,
+  },
+  insufficientTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  insufficientCircle: {
+    width: 78,
+    height: 78,
+    borderRadius: 39,
+    borderWidth: 4,
+    borderColor: "#94A3B8",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 16,
+  },
+  insufficientCircleIcon: {
+    fontSize: 24,
+    fontWeight: "900",
+    color: "#475569",
+    lineHeight: 26,
+  },
+  insufficientCircleSub: {
+    fontSize: 9.5,
+    fontWeight: "800",
+    color: "#64748B",
+    marginTop: 2,
+  },
+  addLabelForMissingBtn: {
+    marginTop: 14,
+    backgroundColor: "#16A34A",
+    borderRadius: 13,
+    paddingVertical: 13,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#16A34A",
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  addLabelForMissingBtnText: {
+    color: "#FFFFFF",
+    fontSize: 13.5,
+    fontWeight: "800",
+  },
   scoreBanner: {
     flexDirection: "row",
     alignItems: "center",
@@ -2247,6 +2549,184 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#1E293B",
     marginBottom: 10,
+  },
+  breakdownHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  breakdownToggleBtn: {
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  breakdownToggleBtnText: {
+    fontSize: 11.5,
+    fontWeight: "700",
+    color: "#334155",
+  },
+  transparencySourceRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 6,
+  },
+  sourceInfoChip: {
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
+  sourceInfoChipText: {
+    fontSize: 11.5,
+    fontWeight: "700",
+    color: "#334155",
+  },
+  missingCountChip: {
+    backgroundColor: "#FFFBEB",
+    borderWidth: 1,
+    borderColor: "#FDE68A",
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
+  missingCountChipText: {
+    fontSize: 11.5,
+    fontWeight: "700",
+    color: "#B45309",
+  },
+  breakdownDetailBox: {
+    marginTop: 10,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    borderRadius: 14,
+    padding: 12,
+  },
+  breakdownStartRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingBottom: 10,
+    marginBottom: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E2E8F0",
+  },
+  breakdownStartLabel: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#0F172A",
+  },
+  breakdownStartBadge: {
+    backgroundColor: "#E0F2FE",
+    borderWidth: 1,
+    borderColor: "#BAE6FD",
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
+  breakdownStartBadgeText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#0369A1",
+  },
+  breakdownItemRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F1F5F9",
+  },
+  breakdownItemLeft: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  breakdownItemTitleRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6,
+    marginBottom: 3,
+  },
+  breakdownItemLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#0F172A",
+  },
+  breakdownValuePill: {
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#CBD5E1",
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+  },
+  breakdownValuePillText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#334155",
+  },
+  breakdownItemReason: {
+    fontSize: 11.5,
+    color: "#64748B",
+    lineHeight: 16,
+  },
+  breakdownImpactBadge: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    minWidth: 66,
+    alignItems: "center",
+  },
+  breakdownImpactText: {
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  capNoticeBox: {
+    marginTop: 10,
+    backgroundColor: "#FFFBEB",
+    borderWidth: 1,
+    borderColor: "#FCD34D",
+    borderRadius: 10,
+    padding: 10,
+  },
+  capNoticeTitle: {
+    fontSize: 12.5,
+    fontWeight: "800",
+    color: "#B45309",
+    marginBottom: 2,
+  },
+  capNoticeText: {
+    fontSize: 12,
+    color: "#92400E",
+    lineHeight: 17,
+  },
+  breakdownFinalRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 10,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#CBD5E1",
+  },
+  breakdownFinalLabel: {
+    fontSize: 13.5,
+    fontWeight: "800",
+    color: "#0F172A",
+  },
+  breakdownFinalValue: {
+    fontSize: 14,
+    fontWeight: "900",
   },
   progressRow: {
     marginBottom: 10,

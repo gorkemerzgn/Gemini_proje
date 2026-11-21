@@ -11,11 +11,12 @@ from database import (
     get_database_stats,
     get_recent_products,
     init_db,
+    is_cached_product_missing_nutrition,
     save_product,
     search_products_by_text,
 )
 from label_analyzer import extract_label_data_from_image
-from openfoodfacts import fetch_product_by_barcode
+from openfoodfacts import _merge_parsed_off_products, fetch_product_by_barcode
 from scoring import DEFAULT_DISCLAIMER, calculate_product_score
 
 # .env dosyasındaki ortam değişkenlerini yükle
@@ -102,15 +103,55 @@ class ScoreBreakdown(BaseModel):
     )
 
 
+class ScoreBreakdownItem(BaseModel):
+    """Şeffaf puan kırılımı tekil kalemi"""
+
+    label: str = Field(description="Değerlendirilen kriter adı (örn: 'Şeker (100g)')")
+    value_text: str = Field(
+        description="Okunan veya hesaplanan değer metni (örn: '24.5 g' veya '—')"
+    )
+    impact: float = Field(description="Puana etkisi (örn: -18, +3, 0)")
+    reason: str = Field(description="Nesnel ve yargısız hesaplama gerekçesi")
+
+
+GradeLiteral = Literal["Çok İyi", "İyi", "Orta", "Düşük Skor", "Yetersiz Veri"]
+
+
 class ScoreResponse(BaseModel):
     """Ürün puanlama yanıt modeli"""
 
     product_name: Optional[str] = Field(default=None, description="Ürün adı")
-    score: int = Field(ge=0, le=100, description="Hesaplanan nihai ürün puanı (0 - 100)")
-    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
-        description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor)"
+    insufficient_data: bool = Field(
+        default=False,
+        description="Besin değerleri eksik olduğu için puan hesaplanamadı mı?",
+    )
+    score: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Hesaplanan nihai ürün puanı (0 - 100) veya yetersiz veride None",
+    )
+    grade: GradeLiteral = Field(
+        description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor / Yetersiz Veri)"
     )
     warnings: List[str] = Field(description="Türkçe içerik ve besin bilgilendirme notları")
+    score_breakdown: List[ScoreBreakdownItem] = Field(
+        default_factory=list,
+        description="Kalem bazlı şeffaf puan kırılımı listesi",
+    )
+    cap_applied: bool = Field(
+        default=False,
+        description="Eksik veri veya resmi duyuru nedeniyle puan tavanı uygulandı mı?",
+    )
+    cap_reason: Optional[str] = Field(
+        default=None,
+        description="Uygulanan puan tavanının nesnel açıklaması",
+    )
+    missing_fields_count: int = Field(
+        default=0,
+        ge=0,
+        description="Eksik (None) olan besin değeri alanı sayısı",
+    )
     breakdown: ScoreBreakdown = Field(description="Kategori bazlı puan kırılımı")
     disclaimer: str = Field(
         default=DEFAULT_DISCLAIMER,
@@ -132,20 +173,49 @@ class ProductAnalysisResponse(BaseModel):
     has_glucose_syrup: bool = Field(
         default=False, description="İçerikte glikoz/fruktoz şurubu tespit edildi mi?"
     )
-    data_source: str = Field(default="open_food_facts", description="Veri kaynağı")
+    data_source: str = Field(
+        default="Open Food Facts",
+        description="Veri kaynağı ('Open Food Facts' veya 'Etiket Fotoğrafı (OCR)')",
+    )
     source: str = Field(
         default="open_food_facts",
-        description="Veri kaynağı etiketi (open_food_facts veya label_photo)",
+        description="Veri kaynağı kodu (open_food_facts veya label_photo)",
     )
     from_cache: bool = Field(
         default=False,
         description="Ürün verisi yerel SQLite önbelleğinden mi getirildi?",
     )
-    score: int = Field(ge=0, le=100, description="Hesaplanan nihai ürün puanı (0 - 100)")
-    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
-        description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor)"
+    insufficient_data: bool = Field(
+        default=False,
+        description="Besin değerleri eksik olduğu için puan hesaplanamadı mı?",
+    )
+    score: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Hesaplanan nihai ürün puanı (0 - 100) veya yetersiz veride None",
+    )
+    grade: GradeLiteral = Field(
+        description="Puan derecesi (Çok İyi / İyi / Orta / Düşük Skor / Yetersiz Veri)"
     )
     warnings: List[str] = Field(description="Türkçe içerik ve besin bilgilendirme notları")
+    score_breakdown: List[ScoreBreakdownItem] = Field(
+        default_factory=list,
+        description="Kalem bazlı şeffaf puan kırılımı listesi",
+    )
+    cap_applied: bool = Field(
+        default=False,
+        description="Eksik veri veya resmi duyuru nedeniyle puan tavanı uygulandı mı?",
+    )
+    cap_reason: Optional[str] = Field(
+        default=None,
+        description="Uygulanan puan tavanının nesnel açıklaması",
+    )
+    missing_fields_count: int = Field(
+        default=0,
+        ge=0,
+        description="Eksik (None) olan besin değeri alanı sayısı",
+    )
     breakdown: ScoreBreakdown = Field(description="Kategori bazlı puan kırılımı")
     disclaimer: str = Field(
         default=DEFAULT_DISCLAIMER,
@@ -174,8 +244,17 @@ class RecentProductItem(BaseModel):
     product_name: str = Field(description="Ürün adı")
     brands: Optional[str] = Field(default=None, description="Marka bilgisi")
     image_url: Optional[str] = Field(default=None, description="Ürün görseli URL adresi")
-    score: int = Field(ge=0, le=100, description="Hesaplanan ürün puanı (0 - 100)")
-    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(description="Puan derecesi")
+    insufficient_data: bool = Field(
+        default=False,
+        description="Besin değerleri eksik olduğu için puan hesaplanamadı mı?",
+    )
+    score: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Hesaplanan ürün puanı (0 - 100) veya yetersiz veride None",
+    )
+    grade: GradeLiteral = Field(description="Puan derecesi")
     created_at: str = Field(description="İlk kayıt tarihi (ISO-8601 UTC)")
     updated_at: str = Field(description="Son güncellenme tarihi (ISO-8601 UTC)")
 
@@ -197,11 +276,20 @@ class ProductSearchItem(BaseModel):
     barcode: str = Field(description="Ürün barkod numarası")
     product_name: str = Field(description="Ürün adı")
     brands: Optional[str] = Field(default=None, description="Marka bilgisi")
-    score: int = Field(ge=0, le=100, description="Hesaplanan ürün puanı (0 - 100)")
-    score_label: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
+    insufficient_data: bool = Field(
+        default=False,
+        description="Besin değerleri eksik olduğu için puan hesaplanamadı mı?",
+    )
+    score: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Hesaplanan ürün puanı (0 - 100) veya yetersiz veride None",
+    )
+    score_label: GradeLiteral = Field(
         description="Puan etiketi / derecesi"
     )
-    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
+    grade: GradeLiteral = Field(
         description="Puan derecesi"
     )
     image_url: Optional[str] = Field(default=None, description="Ürün görseli URL adresi")
@@ -443,14 +531,68 @@ def search_products(
 
 
 @app.get("/api/product/{barcode}", response_model=ProductAnalysisResponse)
+@app.get("/api/products/{barcode}", response_model=ProductAnalysisResponse)
 async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
     """
     Barkod numarası ile ürünü önce yerel SQLite önbelleğinde (30 gün geçerli) arar.
-    Önbellekte yoksa veya süresi dolmuşsa Open Food Facts veri tabanından çeker,
-    puanlama motorundan geçirir, veritabanına kaydeder ve analiz sonucunu döndürür.
+    - Ürün önbellekte varsa ancak temel besin değerleri/içindekiler eksikse ve kaynağı
+      `label_photo` değilse, otomatik olarak Open Food Facts ürün detay API'lerinden
+      (`world.openfoodfacts.org` ve `tr.openfoodfacts.org`) eksik verileri tamamlamayı dener.
+    - Önbellekte yoksa doğrudan Open Food Facts'ten çeker, puanlar ve kaydeder.
     """
     cached = get_cached_product(barcode)
     if cached is not None:
+        raw_src = str(cached.get("source") or cached.get("data_source") or "open_food_facts")
+        is_label = raw_src in ("label_photo", "Etiket Fotoğrafı (OCR)")
+        cached["source"] = "label_photo" if is_label else "open_food_facts"
+        cached["data_source"] = "Etiket Fotoğrafı (OCR)" if is_label else "Open Food Facts"
+
+        needs_recalc = (
+            not cached.get("score_breakdown")
+            or "insufficient_data" not in cached
+        )
+
+        # Kayıt yerel DB'de varsa ama besin değerleri eksikse ve label_photo değilse dış kaynaktan tamamla
+        if not is_label and is_cached_product_missing_nutrition(cached):
+            needs_recalc = True
+            try:
+                fresh_off = await fetch_product_by_barcode(barcode)
+                merged = _merge_parsed_off_products(cached, fresh_off)
+                cached["product_name"] = merged["product_name"]
+                cached["brands"] = merged["brands"]
+                cached["image_url"] = merged["image_url"]
+                cached["ingredients_text"] = merged["ingredients_text"]
+                cached["nutrition"] = merged["nutrition"]
+                cached["additives"] = merged["additives"]
+                cached["has_palm_oil"] = merged["has_palm_oil"]
+                cached["has_glucose_syrup"] = merged["has_glucose_syrup"]
+            except Exception:
+                # Dış kaynak erişilemezse veya 404 dönerse mevcut verilerle puanlamayı güncelle
+                pass
+
+        if needs_recalc:
+            recalc = calculate_product_score(
+                nutrition=cached.get("nutrition") or {},
+                additives=cached.get("additives") or [],
+                is_adulterated=bool(
+                    (cached.get("breakdown") or {}).get("adulteration_penalty_applied", False)
+                ),
+                has_palm_oil=bool(cached.get("has_palm_oil", False)),
+                has_glucose_syrup=bool(cached.get("has_glucose_syrup", False)),
+            )
+            cached["insufficient_data"] = recalc["insufficient_data"]
+            cached["score"] = recalc["score"]
+            cached["grade"] = recalc["grade"]
+            cached["warnings"] = recalc["warnings"]
+            cached["score_breakdown"] = recalc["score_breakdown"]
+            cached["cap_applied"] = recalc["cap_applied"]
+            cached["cap_reason"] = recalc["cap_reason"]
+            cached["missing_fields_count"] = recalc["missing_fields_count"]
+            cached["breakdown"] = recalc["breakdown"]
+            cached["disclaimer"] = recalc["disclaimer"]
+            save_product(cached)
+            cached["from_cache"] = True
+
         return ProductAnalysisResponse(**cached)
 
     product_data = await fetch_product_by_barcode(barcode)
@@ -465,7 +607,9 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
 
     warnings = list(score_result["warnings"])
     has_score_missing_warn = any(
-        "puan sınırlı veriye göre hesaplandı" in w for w in warnings
+        "puan sınırlı veriye göre hesaplandı" in w
+        or "besin değerleri veritabanında bulunmadığından" in w
+        for w in warnings
     )
     if product_data.get("has_missing_nutrition") and not has_score_missing_warn:
         warnings.append(
@@ -482,12 +626,17 @@ async def get_product_by_barcode(barcode: str) -> ProductAnalysisResponse:
         additives=product_data["additives"],
         has_palm_oil=product_data["has_palm_oil"],
         has_glucose_syrup=product_data["has_glucose_syrup"],
-        data_source=product_data["data_source"],
-        source=product_data["data_source"],
+        data_source="Open Food Facts",
+        source="open_food_facts",
         from_cache=False,
+        insufficient_data=score_result["insufficient_data"],
         score=score_result["score"],
         grade=score_result["grade"],
         warnings=warnings,
+        score_breakdown=[ScoreBreakdownItem(**item) for item in score_result["score_breakdown"]],
+        cap_applied=score_result["cap_applied"],
+        cap_reason=score_result["cap_reason"],
+        missing_fields_count=score_result["missing_fields_count"],
         breakdown=ScoreBreakdown(**score_result["breakdown"]),
         disclaimer=score_result["disclaimer"],
     )
@@ -523,7 +672,9 @@ async def analyze_product_label(payload: LabelAnalysisRequest) -> ProductAnalysi
 
     warnings = list(score_result["warnings"])
     has_score_missing_warn = any(
-        "puan sınırlı veriye göre hesaplandı" in w for w in warnings
+        "puan sınırlı veriye göre hesaplandı" in w
+        or "besin değerleri veritabanında bulunmadığından" in w
+        for w in warnings
     )
     if label_data.get("has_missing_nutrition") and not has_score_missing_warn:
         warnings.append(
@@ -545,12 +696,17 @@ async def analyze_product_label(payload: LabelAnalysisRequest) -> ProductAnalysi
         additives=label_data["additives"],
         has_palm_oil=label_data["has_palm_oil"],
         has_glucose_syrup=label_data["has_glucose_syrup"],
-        data_source="label_photo",
+        data_source="Etiket Fotoğrafı (OCR)",
         source="label_photo",
         from_cache=False,
+        insufficient_data=score_result["insufficient_data"],
         score=score_result["score"],
         grade=score_result["grade"],
         warnings=warnings,
+        score_breakdown=[ScoreBreakdownItem(**item) for item in score_result["score_breakdown"]],
+        cap_applied=score_result["cap_applied"],
+        cap_reason=score_result["cap_reason"],
+        missing_fields_count=score_result["missing_fields_count"],
         breakdown=ScoreBreakdown(**score_result["breakdown"]),
         disclaimer=score_result["disclaimer"],
     )
