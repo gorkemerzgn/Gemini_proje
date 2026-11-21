@@ -2,11 +2,18 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Literal, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from database import get_cached_product, get_recent_products, init_db, save_product
+from database import (
+    get_cached_product,
+    get_database_stats,
+    get_recent_products,
+    init_db,
+    save_product,
+    search_products_by_text,
+)
 from label_analyzer import extract_label_data_from_image
 from openfoodfacts import fetch_product_by_barcode
 from scoring import DEFAULT_DISCLAIMER, calculate_product_score
@@ -29,7 +36,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="İrem - Gıda & Etiket Analiz API",
     description="Barkod tarama, yapay zekâ ile etiket analizi ve taklit-tağşiş kontrolü API servisi",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -184,6 +191,38 @@ class RecentProductsResponse(BaseModel):
     )
 
 
+class ProductSearchItem(BaseModel):
+    """İsim veya marka araması sonucunda dönen ürün özeti modeli"""
+
+    barcode: str = Field(description="Ürün barkod numarası")
+    product_name: str = Field(description="Ürün adı")
+    brands: Optional[str] = Field(default=None, description="Marka bilgisi")
+    score: int = Field(ge=0, le=100, description="Hesaplanan ürün puanı (0 - 100)")
+    score_label: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
+        description="Puan etiketi / derecesi"
+    )
+    grade: Literal["Çok İyi", "İyi", "Orta", "Düşük Skor"] = Field(
+        description="Puan derecesi"
+    )
+    image_url: Optional[str] = Field(default=None, description="Ürün görseli URL adresi")
+    data_source: str = Field(
+        default="open_food_facts",
+        description="Veri kaynağı (open_food_facts veya label_photo)",
+    )
+
+
+class ProductSearchResponse(BaseModel):
+    """İsim veya marka ile ürün arama yanıt modeli"""
+
+    query: str = Field(description="Aranan metin")
+    count: int = Field(description="Eşleşen ürün sayısı")
+    items: List[ProductSearchItem] = Field(description="Arama sonuçları listesi")
+    disclaimer: str = Field(
+        default=DEFAULT_DISCLAIMER,
+        description="Bilgilendirme ve yasal sorumluluk reddi metni",
+    )
+
+
 class MethodologyWeightItem(BaseModel):
     """Puanlama metodolojisi kategori ağırlık kalemi"""
 
@@ -218,6 +257,18 @@ class MethodologyResponse(BaseModel):
     )
 
 
+class DatabaseStatsResponse(BaseModel):
+    """Yerel SQLite veritabanı ürün istatistikleri yanıt modeli"""
+
+    total_products: int = Field(description="Veritabanındaki toplam ürün sayısı")
+    open_food_facts_count: int = Field(
+        description="Open Food Facts kaynağından eklenen ürün sayısı"
+    )
+    label_photo_count: int = Field(
+        description="Etiket fotoğrafından (OCR) eklenen ürün sayısı"
+    )
+
+
 # -----------------------------------------------------------------------------
 # API Uç Noktaları (Endpoints)
 # -----------------------------------------------------------------------------
@@ -226,7 +277,7 @@ def read_root():
     """Kök uç noktası - Servis karşılama mesajı"""
     return {
         "message": "Gıda Dedektifi API çalışıyor",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "docs": "/docs",
     }
 
@@ -238,6 +289,16 @@ def health_check():
         "status": "healthy",
         "service": "backend-api",
     }
+
+
+@app.get("/api/stats", response_model=DatabaseStatsResponse)
+def read_database_stats() -> DatabaseStatsResponse:
+    """
+    Yerel SQLite veritabanındaki toplam ürün sayısını, Open Food Facts kaynaklı
+    ürün sayısını ve etiket fotoğrafından (`label_photo`) eklenen ürün sayısını döndürür.
+    """
+    stats = get_database_stats()
+    return DatabaseStatsResponse(**stats)
 
 
 @app.get("/api/methodology", response_model=MethodologyResponse)
@@ -349,6 +410,32 @@ def list_recent_products(
     recent_rows = get_recent_products(limit=limit)
     items = [RecentProductItem(**row) for row in recent_rows]
     return RecentProductsResponse(
+        count=len(items),
+        items=items,
+        disclaimer=DEFAULT_DISCLAIMER,
+    )
+
+
+@app.get("/api/products/search", response_model=ProductSearchResponse)
+def search_products(
+    q: str = Query(..., min_length=2, description="Aranacak ürün veya marka adı (en az 2 karakter)"),
+    limit: int = Query(default=15, ge=1, le=50, description="Maksimum arama sonucu sayısı"),
+) -> ProductSearchResponse:
+    """
+    Yerel SQLite veritabanındaki ürünlerde ürün adı (`product_name`) ve marka (`brands`)
+    üzerinden Türkçe karakter ve büyük/küçük harf duyarsız arama yapar.
+    """
+    cleaned_q = (q or "").strip()
+    if len(cleaned_q) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Arama yapmak için en az 2 karakter girmelisiniz.",
+        )
+
+    matched_rows = search_products_by_text(query=cleaned_q, limit=limit)
+    items = [ProductSearchItem(**row) for row in matched_rows]
+    return ProductSearchResponse(
+        query=cleaned_q,
         count=len(items),
         items=items,
         disclaimer=DEFAULT_DISCLAIMER,

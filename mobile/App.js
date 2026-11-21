@@ -161,6 +161,8 @@ export default function App() {
   const [barcode, setBarcode] = useState("");
   const [product, setProduct] = useState(null);
   const [recentProducts, setRecentProducts] = useState([]);
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchedQuery, setSearchedQuery] = useState(null);
   const [loading, setLoading] = useState(false);
   const [labelAnalyzing, setLabelAnalyzing] = useState(false);
   const [localLabelImageUri, setLocalLabelImageUri] = useState(null);
@@ -235,6 +237,8 @@ export default function App() {
       setLoading(true);
       setErrorMsg(null);
       setNotFoundBarcode(null);
+      setSearchedQuery(null);
+      setSearchResults([]);
       setLocalLabelImageUri(null);
 
       try {
@@ -279,6 +283,81 @@ export default function App() {
       }
     },
     [barcode, fetchRecentProducts]
+  );
+
+  // İsim veya marka ile yerel veritabanında ürün arama (GET /api/products/search)
+  const searchProductsByText = useCallback(async (queryText) => {
+    const cleaned = String(queryText || "").trim();
+    if (cleaned.length < 2) {
+      setErrorMsg("Ürün veya marka araması için en az 2 karakter girin.");
+      return;
+    }
+
+    Keyboard.dismiss();
+    setBarcode(cleaned);
+    setLoading(true);
+    setErrorMsg(null);
+    setNotFoundBarcode(null);
+    setProduct(null);
+    setLocalLabelImageUri(null);
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/products/search?q=${encodeURIComponent(
+          cleaned
+        )}&limit=15`
+      );
+
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_parseErr) {
+        data = null;
+      }
+
+      if (!response.ok) {
+        setSearchedQuery(null);
+        setSearchResults([]);
+        setErrorMsg(
+          data?.detail || `Arama sırasında sunucu hatası oluştu (HTTP ${response.status}).`
+        );
+        return;
+      }
+
+      setSearchedQuery(cleaned);
+      setSearchResults(Array.isArray(data?.items) ? data.items : []);
+    } catch (_networkErr) {
+      setSearchedQuery(null);
+      setSearchResults([]);
+      setErrorMsg(
+        `Sunucuya bağlanılamadı (${API_BASE_URL}). Telefonunuzun ve bilgisayarınızın aynı Wi-Fi ağında olduğundan ve backend sunucusunun 8001 portunda çalıştığından emin olun.`
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Çift görevli giriş: 6-14 hane rakamsa barkod analizi, metinse ürün/marka araması
+  const handleSearchOrAnalyze = useCallback(
+    async (rawInput) => {
+      const cleaned = String(rawInput ?? barcode ?? "").trim();
+      if (!cleaned) {
+        setNotFoundBarcode(null);
+        setSearchedQuery(null);
+        setSearchResults([]);
+        setErrorMsg(
+          "Lütfen analiz etmek için bir barkod veya ürün / marka adı girin."
+        );
+        return;
+      }
+
+      if (/^\d{6,14}$/.test(cleaned)) {
+        await analyzeBarcode(cleaned);
+      } else {
+        await searchProductsByText(cleaned);
+      }
+    },
+    [barcode, analyzeBarcode, searchProductsByText]
   );
 
   // Çekilen veya galeriden seçilen etiket fotoğrafını (base64) backend'e gönderip analiz etme
@@ -821,25 +900,33 @@ export default function App() {
 
           <View style={styles.dividerRow}>
             <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>veya elle barkod girin</Text>
+            <Text style={styles.dividerText}>
+              veya barkod / ürün adı girin
+            </Text>
             <View style={styles.dividerLine} />
           </View>
 
           <View style={styles.inputRow}>
             <TextInput
               style={styles.input}
-              placeholder="Barkod girin (örn: 3017620422003)"
+              placeholder="Barkod veya ürün / marka adı girin"
               placeholderTextColor="#94A3B8"
-              keyboardType="numeric"
+              keyboardType="default"
+              autoCapitalize="none"
+              autoCorrect={false}
               value={barcode}
               onChangeText={setBarcode}
-              onSubmitEditing={() => analyzeBarcode(barcode)}
+              onSubmitEditing={() => handleSearchOrAnalyze(barcode)}
               returnKeyType="search"
             />
             {barcode.length > 0 && (
               <TouchableOpacity
                 style={styles.clearBtn}
-                onPress={() => setBarcode("")}
+                onPress={() => {
+                  setBarcode("");
+                  setSearchedQuery(null);
+                  setSearchResults([]);
+                }}
               >
                 <Text style={styles.clearBtnText}>✕</Text>
               </TouchableOpacity>
@@ -851,7 +938,7 @@ export default function App() {
               styles.analyzeButton,
               (loading || labelAnalyzing) && styles.analyzeButtonDisabled,
             ]}
-            onPress={() => analyzeBarcode(barcode)}
+            onPress={() => handleSearchOrAnalyze(barcode)}
             disabled={loading || labelAnalyzing}
             activeOpacity={0.85}
           >
@@ -886,7 +973,12 @@ export default function App() {
           <View style={styles.directLabelSection}>
             <TouchableOpacity
               style={styles.directLabelBtn}
-              onPress={() => handleAnalyzeLabelPhoto("camera", barcode || null)}
+              onPress={() =>
+                handleAnalyzeLabelPhoto(
+                  "camera",
+                  /^\d{6,14}$/.test(barcode.trim()) ? barcode.trim() : null
+                )
+              }
               disabled={loading || labelAnalyzing}
               activeOpacity={0.8}
             >
@@ -896,7 +988,12 @@ export default function App() {
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.directLabelGalleryBtn}
-              onPress={() => handleAnalyzeLabelPhoto("gallery", barcode || null)}
+              onPress={() =>
+                handleAnalyzeLabelPhoto(
+                  "gallery",
+                  /^\d{6,14}$/.test(barcode.trim()) ? barcode.trim() : null
+                )
+              }
               disabled={loading || labelAnalyzing}
               activeOpacity={0.8}
             >
@@ -904,6 +1001,93 @@ export default function App() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* İSİM / MARKA ARAMA SONUÇLARI KARTI */}
+        {searchedQuery && !loading && !labelAnalyzing && (
+          <View style={styles.searchResultsCard}>
+            <View style={styles.recentHeaderRow}>
+              <Text style={styles.recentTitle}>
+                Arama Sonuçları ({searchResults.length})
+              </Text>
+              <TouchableOpacity
+                onPress={() => {
+                  setSearchedQuery(null);
+                  setSearchResults([]);
+                }}
+              >
+                <Text style={styles.refreshBtnText}>Temizle</Text>
+              </TouchableOpacity>
+            </View>
+
+            {searchResults.length === 0 ? (
+              <View style={styles.emptyRecentBox}>
+                <Text style={styles.emptyRecentText}>
+                  Veritabanında eşleşen ürün bulunamadı. Barkod okutarak veya
+                  etiket fotoğrafı çekerek analiz edebilirsiniz.
+                </Text>
+              </View>
+            ) : (
+              searchResults.map((item) => {
+                const itemTheme = getScoreTheme(item.score);
+                const labelText = item.score_label || item.grade;
+                return (
+                  <TouchableOpacity
+                    key={item.barcode}
+                    style={styles.recentCard}
+                    onPress={() => analyzeBarcode(item.barcode)}
+                    activeOpacity={0.8}
+                  >
+                    {item.image_url ? (
+                      <Image
+                        source={{ uri: item.image_url }}
+                        style={styles.recentImage}
+                        resizeMode="contain"
+                      />
+                    ) : (
+                      <View style={styles.recentImagePlaceholder}>
+                        <Text style={styles.recentPlaceholderText}>Ürün</Text>
+                      </View>
+                    )}
+
+                    <View style={styles.recentInfo}>
+                      <Text style={styles.recentName} numberOfLines={1}>
+                        {item.product_name}
+                      </Text>
+                      <Text style={styles.recentBrand} numberOfLines={1}>
+                        {item.brands || `#${item.barcode}`}
+                      </Text>
+                    </View>
+
+                    <View
+                      style={[
+                        styles.recentScorePill,
+                        {
+                          backgroundColor: itemTheme.softBg,
+                          borderColor: itemTheme.border,
+                        },
+                      ]}
+                    >
+                      <View
+                        style={[
+                          styles.recentScoreDot,
+                          { backgroundColor: itemTheme.dot },
+                        ]}
+                      />
+                      <Text
+                        style={[
+                          styles.recentScoreText,
+                          { color: itemTheme.primary },
+                        ]}
+                      >
+                        {item.score} • {labelText}
+                      </Text>
+                    </View>
+                  </TouchableOpacity>
+                );
+              })
+            )}
+          </View>
+        )}
 
         {/* ETİKET OKUNUYOR YÜKLENME KARTI */}
         {labelAnalyzing && (
@@ -2200,6 +2384,9 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     fontStyle: "italic",
     textAlign: "center",
+  },
+  searchResultsCard: {
+    marginBottom: 18,
   },
   recentSection: {
     marginTop: 4,

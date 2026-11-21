@@ -21,12 +21,41 @@ DB_PATH = DB_DIR / "irem.db"
 CACHE_TTL_DAYS = 30
 
 
+def _normalize_tr_search(text: Optional[str]) -> str:
+    """
+    Türkçe harfleri (İ/i, I/ı, Ş/ş, Ğ/ğ, Ü/ü, Ö/ö, Ç/ç) ASCII küçük harf
+    karşılıklarına dönüştürür; böylece SQLite sorgularında 'cikolata' -> 'Çikolata',
+    'sut' -> 'Süt', 'ulker' -> 'Ülker' eşleşmesi sağlanır.
+    """
+    if not text:
+        return ""
+    return (
+        str(text)
+        .replace("İ", "i")
+        .replace("I", "i")
+        .replace("ı", "i")
+        .replace("Ş", "s")
+        .replace("ş", "s")
+        .replace("Ğ", "g")
+        .replace("ğ", "g")
+        .replace("Ü", "u")
+        .replace("ü", "u")
+        .replace("Ö", "o")
+        .replace("ö", "o")
+        .replace("Ç", "c")
+        .replace("ç", "c")
+        .lower()
+        .strip()
+    )
+
+
 def _get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """SQLite veritabanı bağlantısı oluşturur ve Row fabrikasını ayarlar."""
+    """SQLite veritabanı bağlantısı oluşturur, Row fabrikasını ve Türkçe arama fonksiyonunu ayarlar."""
     target_path = Path(db_path) if db_path else DB_PATH
     target_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target_path))
     conn.row_factory = sqlite3.Row
+    conn.create_function("tr_norm", 1, _normalize_tr_search)
     return conn
 
 
@@ -202,3 +231,142 @@ def get_recent_products(
         )
 
     return recent_list
+
+
+def is_label_photo_product(
+    barcode: str,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """
+    Verilen barkodun veritabanında mevcut olup olmadığını ve kullanıcının
+    etiket fotoğrafıyla (`label_photo`) kaydedilip kaydedilmediğini kontrol eder.
+    """
+    cleaned_barcode = (barcode or "").strip()
+    if not cleaned_barcode:
+        return False
+
+    with closing(_get_connection(db_path)) as conn:
+        row = conn.execute(
+            "SELECT response_json FROM products WHERE barcode = ?",
+            (cleaned_barcode,),
+        ).fetchone()
+
+    if row is None:
+        return False
+
+    try:
+        parsed = json.loads(row["response_json"])
+        source = parsed.get("data_source") or parsed.get("source")
+        return source == "label_photo"
+    except ValueError:
+        return False
+
+
+def get_database_stats(
+    db_path: Optional[Path] = None,
+) -> Dict[str, int]:
+    """
+    Yerel SQLite veritabanındaki toplam ürün sayısını, Open Food Facts kaynaklı
+    ürün sayısını ve etiket fotoğrafından (`label_photo`) eklenen ürün sayısını döndürür.
+    """
+    with closing(_get_connection(db_path)) as conn:
+        rows = conn.execute("SELECT response_json FROM products").fetchall()
+
+    total_products = len(rows)
+    label_photo_count = 0
+    open_food_facts_count = 0
+
+    for row in rows:
+        source = "open_food_facts"
+        try:
+            parsed = json.loads(row["response_json"])
+            source = str(
+                parsed.get("data_source") or parsed.get("source") or "open_food_facts"
+            )
+        except ValueError:
+            pass
+
+        if source == "label_photo":
+            label_photo_count += 1
+        else:
+            open_food_facts_count += 1
+
+    return {
+        "total_products": total_products,
+        "open_food_facts_count": open_food_facts_count,
+        "label_photo_count": label_photo_count,
+    }
+
+
+def search_products_by_text(
+    query: str,
+    limit: int = 15,
+    db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Ürün adı (`product_name`) ve marka (`brands`) alanlarında SQLite `tr_norm`
+    fonksiyonu üzerinden Türkçe karakter ve büyük/küçük harf duyarsız arama yapar.
+    """
+    norm_q = _normalize_tr_search(query)
+    if len(norm_q) < 2:
+        return []
+
+    safe_limit = max(1, min(50, int(limit)))
+    like_pattern = f"%{norm_q}%"
+    prefix_pattern = f"{norm_q}%"
+
+    with closing(_get_connection(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT barcode, product_name, brands, score, grade,
+                   response_json, created_at, updated_at
+            FROM products
+            WHERE tr_norm(product_name) LIKE ?
+               OR tr_norm(COALESCE(brands, '')) LIKE ?
+               OR tr_norm(product_name || ' ' || COALESCE(brands, '')) LIKE ?
+            ORDER BY
+                CASE
+                    WHEN tr_norm(product_name) LIKE ? THEN 0
+                    WHEN tr_norm(COALESCE(brands, '')) LIKE ? THEN 1
+                    ELSE 2
+                END ASC,
+                updated_at DESC
+            LIMIT ?
+            """,
+            (
+                like_pattern,
+                like_pattern,
+                like_pattern,
+                prefix_pattern,
+                prefix_pattern,
+                safe_limit,
+            ),
+        ).fetchall()
+
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        image_url = None
+        data_source = "open_food_facts"
+        try:
+            parsed = json.loads(row["response_json"])
+            image_url = parsed.get("image_url")
+            data_source = str(
+                parsed.get("data_source") or parsed.get("source") or "open_food_facts"
+            )
+        except ValueError:
+            pass
+
+        results.append(
+            {
+                "barcode": row["barcode"],
+                "product_name": row["product_name"],
+                "brands": row["brands"],
+                "score": row["score"],
+                "score_label": row["grade"],
+                "grade": row["grade"],
+                "image_url": image_url,
+                "data_source": data_source,
+            }
+        )
+
+    return results
